@@ -252,7 +252,7 @@ private struct HttpTTSFailoverSettingsView: View {
                 }
             }
             Section {
-                Text("恢复探测使用真实下一段正文，付费渠道可能计费。自动切换使用完整音频合成，每次请求最长等待 20 秒；试听不切换渠道。")
+                Text("播放期间会提前生成下一段或下一页，恢复探测也使用真实正文，付费渠道可能计费。完整音频合成沿用渠道服务的 300 秒请求超时；试听不切换渠道。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }

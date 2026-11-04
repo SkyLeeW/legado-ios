@@ -2066,11 +2066,16 @@ struct ReaderView: View {
         }
         let pageText = (model.content as NSString).substring(with: pageRange)
         if let engine = selectedHTTPEngine {
+            // 下一页必须使用排版后的真实范围，确保预生成文本与翻页后的播放请求一致。
+            let nextIndex = index + 1
+            let nextText = readerPageRanges.indices.contains(nextIndex)
+                ? (model.content as NSString).substring(with: readerPageRanges[nextIndex]) : nil
             speech.speakHTTP(
                 engine: engine,
                 text: pageText,
                 continuesAcrossChapters: true,
-                segmentIndexOffset: 0
+                segmentIndexOffset: 0,
+                nextText: nextText
             )
         } else {
             speech.speak(pageText, continuesAcrossChapters: true, segmentIndexOffset: 0)
@@ -2095,16 +2100,18 @@ struct ReaderView: View {
     }
 
     private func prefetchNextChapterSpeech(engine: HttpTTS) {
+        let session = speech.httpSessionID
         Task {
             guard let content = await model.nextSpeechContent(
                 rules: model.usesReplaceRules ? replaceRules.rules : []
-            ), selectedHTTPEngine?.id == engine.id else { return }
-            speech.prefetchHTTP(engine: engine, text: content, limit: 10)
+            ), selectedHTTPEngine?.id == engine.id, speech.httpSessionID == session else { return }
+            speech.prepareHTTPContinuation(text: content)
         }
     }
 
     private func continueSpeechToNextChapter() {
         guard model.canGoNext else {
+            speech.stop()
             speechTimerTask?.cancel()
             speechTimerRemaining = 0
             return
