@@ -142,7 +142,7 @@ jobs:
           notes = (
               f"版本：{version}，构建号：{build}\n\n"
               "提供未签名 IPA，下载后需自行签名安装。\n\n"
-              "自动验证已通过：核心及页面模型测试、iOS 模拟器构建、真机架构归档、IPA 完整性检查。"
+              "自动验证已通过：核心及页面模型测试、iOS 模拟器构建、EPUB 原排版与菜单回归、真机架构归档、IPA 完整性检查。"
               "未进行真机运行或付费 MiMo API 调用。\n\n"
               f"源码提交：{os.environ['GITHUB_SHA']}\n\n"
               + Path("CHANGELOG.md").read_text(encoding="utf-8")

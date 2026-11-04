@@ -80,6 +80,11 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
             let adapter = DirectionalNavigationAdapter()
             adapter.bind(to: controller)
             navigationAdapter = adapter
+            // 边缘翻页先消费点击，剩余的中央点击只切换菜单，不再经过旧委托回调。
+            controller.addObserver(.activate { [weak self] _ in
+                self?.showsControls.toggle()
+                return true
+            })
             var entries: [TOCEntry] = []
             func append(_ links: [ReadiumShared.Link], depth: Int) {
                 for link in links {
@@ -130,10 +135,6 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
 
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {
         errorMessage = error.localizedDescription
-    }
-
-    func navigator(_ navigator: VisualNavigator, didTapAt point: CGPoint) {
-        showsControls.toggle()
     }
 
     func clearError() { errorMessage = nil }
@@ -187,24 +188,29 @@ struct EPUBReaderView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.showsControls { topBar }
-            Group {
-                if let navigator = model.navigator {
-                    EPUBNavigatorHost(navigator: navigator)
-                } else if let error = model.errorMessage {
-                    VStack(spacing: 16) {
-                        Text("无法打开 EPUB").font(.headline)
-                        Text(error).font(.footnote).foregroundStyle(.secondary)
-                        Button("重试") { Task { await model.open(preferences: preferences) } }
-                        Button("返回书架") { dismiss() }
-                    }.padding()
-                } else {
-                    ProgressView("正在打开 EPUB…")
-                }
+        Group {
+            if let navigator = model.navigator {
+                EPUBNavigatorHost(navigator: navigator)
+            } else if let error = model.errorMessage {
+                VStack(spacing: 16) {
+                    Text("无法打开 EPUB").font(.headline)
+                    Text(error).font(.footnote).foregroundStyle(.secondary)
+                    Button("重试") { Task { await model.open(preferences: preferences) } }
+                    Button("返回书架") { dismiss() }
+                }.padding()
+            } else {
+                ProgressView("正在打开 EPUB…")
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if model.showsControls, model.navigator != nil { bottomBar }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 工具栏叠加在正文上，不改变视口尺寸，避免开关菜单时触发 EPUB 重新分页。
+        .overlay(alignment: .top) {
+            if model.showsControls { topBar.background(Color(uiColor: .systemBackground)) }
+        }
+        .overlay(alignment: .bottom) {
+            if model.showsControls, model.navigator != nil {
+                bottomBar.background(Color(uiColor: .systemBackground))
+            }
         }
         .background(Color(uiColor: .systemBackground))
         .navigationBarHidden(true)
