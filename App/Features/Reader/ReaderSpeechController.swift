@@ -83,6 +83,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private(set) var isPaused = false
     var onStatus: ((String, Bool) -> Void)?
     var onAdvance: ((ReaderHTTPSpeechUnit) -> Void)?
+    var onComplete: ((ReaderHTTPSpeechUnit) -> Void)?
     var onNeedMore: (() -> Void)?
     var onError: ((String?) -> Void)?
     var onFinish: (() -> Void)?
@@ -439,6 +440,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         guard player === self.player, !stopped else { return }
         if !flag { playbackFailed(CocoaError(.fileReadCorruptFile)); return }
+        onComplete?(units[index])
         self.player = nil
         removeFile(prepared[units[index].id]!.fileURL)
         prepared[units[index].id] = nil
@@ -578,6 +580,8 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     @Published private(set) var isBuffering = false
     private var continuousHTTPQueue: ReaderHTTPSpeechQueue?
     var onNeedHTTPChapters: (() -> Void)?
+    var onHTTPProgress: (() -> Void)?
+    private(set) var httpProgress: (chapterIndex: Int, position: Int)?
     private let synthesizer = AVSpeechSynthesizer()
     private let httpService = HttpTTSService()
     private var audioPlayer: AVAudioPlayer?
@@ -669,6 +673,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         continuousHTTPQueue?.stop()
         continuousHTTPQueue = nil
         currentHTTPUnit = nil
+        httpProgress = nil
         isBuffering = false
         recoveryTask?.cancel()
         recoveryTask = nil
@@ -818,9 +823,15 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
             self.updateNowPlaying()
         }
         queue.onAdvance = { [weak self] unit in
+            self?.httpProgress = (unit.chapterIndex, unit.position)
+            self?.onHTTPProgress?()
             self?.chapterTitle = unit.chapterTitle
             self?.currentHTTPUnit = unit
             self?.updateNowPlaying()
+        }
+        queue.onComplete = { [weak self] unit in
+            self?.httpProgress = (unit.chapterIndex, unit.position + unit.text.utf16.count)
+            self?.onHTTPProgress?()
         }
         queue.onNeedMore = { [weak self] in self?.onNeedHTTPChapters?() }
         queue.onError = { [weak self] error in self?.errorMessage = error }

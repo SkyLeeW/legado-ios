@@ -227,6 +227,7 @@ struct ReaderView: View {
             speech.onNextChapter = { moveSpeechToChapter(direction: 1) }
             speech.onPreviousChapter = { moveSpeechToChapter(direction: -1) }
             speech.onNeedHTTPChapters = { loadMoreHTTPSpeechChapters() }
+            speech.onHTTPProgress = { saveProgress(immediate: true) }
             speech.onRemoteStop = {
                 speechTimerTask?.cancel()
                 speechTimerRemaining = 0
@@ -258,8 +259,9 @@ struct ReaderView: View {
             speechPrefetchTask?.cancel()
             isAutoReading = false
             UIApplication.shared.isIdleTimerDisabled = false
-            if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
+            // 先保存实际听书进度，再停止队列；关闭翻页跟随也不会丢失已听到的位置。
             saveProgress(immediate: true)
+            if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
             ReaderScreenOrientation.restoreApplicationDefault()
             activity.cancelReading(book)
             UIDevice.current.isBatteryMonitoringEnabled = false
@@ -272,6 +274,7 @@ struct ReaderView: View {
             speech.onPreviousChapter = nil
             speech.onRemoteStop = nil
             speech.onNeedHTTPChapters = nil
+            speech.onHTTPProgress = nil
         }
         .overlay(alignment: .bottom) {
             if showsReaderMenu {
@@ -2016,8 +2019,10 @@ struct ReaderView: View {
 
 
     private func saveProgress(immediate: Bool = false) {
-        guard let chapter = model.currentChapter else { return }
-        let position = readerPosition
+        let progress = speech.httpProgress
+        let chapter = progress.map { model.chapters[$0.chapterIndex] } ?? model.currentChapter
+        guard let chapter else { return }
+        let position = progress?.position ?? readerPosition
         let currentBook = book
         progressSaveGeneration &+= 1
         progressSaveTask?.cancel()
@@ -2048,6 +2053,7 @@ struct ReaderView: View {
         configureSpeech()
         if speech.isSpeaking || speech.isPaused {
             speechStartGeneration &+= 1
+            saveProgress(immediate: true)
             speech.stop()
             speechTimerTask?.cancel()
             speechTimerRemaining = 0
