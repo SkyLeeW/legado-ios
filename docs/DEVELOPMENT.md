@@ -76,7 +76,7 @@ RSS 界面回归还验证正文的手动刷新确实重新请求网络。核心�
 
 ## GitHub 自动构建与发布
 
-`.github/workflows/ios-release.yml` 在推送 `dev` 或 `v*` 标签后运行。工作流固定使用 macOS 15 与 Xcode 26.1.1，依次执行资源检查、脚本测试、Swift 核心及页面模型测试、模拟器构建、EPUB 原排版及菜单布局回归、真机架构归档和 IPA 完整性核验；任一步失败均停止发布。
+`.github/workflows/ios-release.yml` 在推送 `dev` 或 `v*` 标签后运行。工作流固定使用 `macos-15-intel` 托管运行器与 Xcode 26.1.1，依次执行资源检查、脚本测试、Swift 核心及页面模型测试、模拟器构建、EPUB 原排版及菜单布局回归、真机架构归档和 IPA 完整性核验；任一步失败均停止发布。
 
 推送 `dev` 自动发布 `v<工程版本>-dev.<工作流序号>` 开发预览版。推送 `v<工程版本>` 标签发布正式版，含 `-beta`、`-rc` 等后缀的标签发布预览版。构建号由工程基础构建号加工作流序号生成。安装包与 SHA-256 校验文件同时保存到 Actions artifacts 和当前仓库的 GitHub Releases。
 
