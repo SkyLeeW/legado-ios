@@ -42,8 +42,15 @@ final class EPUBReaderIntegrationTests: XCTestCase {
         defer { window.isHidden = true }
         window.layoutIfNeeded()
         try await waitForJavaScript("!!document.querySelector('#paragraph79')", in: navigator)
+        try await waitForPagination("Text/chapter.xhtml", in: navigator)
         await model.go(to: ReadiumShared.Link(href: "Text/chapter.xhtml#paragraph20", mediaType: .xhtml))
+        XCTAssertNil(model.errorMessage)
         try await waitForLocation("Text/chapter.xhtml", in: model)
+        try await waitForJavaScript("""
+        Array.from(document.querySelector('#paragraph20').getClientRects()).some(rect =>
+            rect.right > 0 && rect.left < window.innerWidth &&
+            rect.bottom > 0 && rect.top < window.innerHeight)
+        """, in: navigator)
         let originalBounds = navigator.view.bounds
         let visibleElement = await navigator.firstVisibleElementLocator()
         let originalVisible = try XCTUnwrap(visibleElement)
@@ -97,6 +104,20 @@ final class EPUBReaderIntegrationTests: XCTestCase {
         try await waitForJavaScript("!!document.querySelector('#body') && !!document.querySelector('table')", in: reopened)
         try await waitForLocation("Text/chapter.xhtml", in: restored)
         XCTAssertEqual(EPUBReaderModel.path(try XCTUnwrap(restored.location).href.string), "Text/chapter.xhtml")
+    }
+
+    /// 以 Readium 的分页视口报告为就绪条件，避免在 CSS 排版之前读取整章文本作为基准。
+    private func waitForPagination(_ path: String, in navigator: EPUBNavigatorViewController) async throws {
+        for _ in 0..<150 {
+            if let range = navigator.viewport?.progressions.first(where: {
+                EPUBReaderModel.path($0.key.string) == path
+            })?.value {
+                let visibleFraction = range.upperBound - range.lowerBound
+                if visibleFraction > 0, visibleFraction < 1 { return }
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTFail("Readium 尚未将长正文分页，不能建立阅读位置基准")
     }
 
     private func waitForLocation(_ path: String, in model: EPUBReaderModel) async throws {
