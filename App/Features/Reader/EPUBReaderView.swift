@@ -171,8 +171,14 @@ struct EPUBReaderView: View {
     @AppStorage("epubPublisherStyles") private var publisherStyles = true
     @AppStorage("epubTheme") private var theme = "system"
 
+    /// 使用书籍信息创建原排版阅读模型。
     init(book: Book, chapters: [BookChapter], initialIndex: Int) {
-        _model = StateObject(wrappedValue: EPUBReaderModel(book: book, chapters: chapters, initialIndex: initialIndex))
+        self.init(model: EPUBReaderModel(book: book, chapters: chapters, initialIndex: initialIndex))
+    }
+
+    /// 接收已有阅读模型，让页面与布局回归共享同一份导航状态。
+    init(model: EPUBReaderModel) {
+        _model = StateObject(wrappedValue: model)
     }
 
     private var preferences: EPUBPreferences {

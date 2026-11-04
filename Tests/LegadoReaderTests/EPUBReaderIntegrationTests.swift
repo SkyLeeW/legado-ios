@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import ReadiumShared
 import ReadiumNavigator
 import ZIPFoundation
@@ -7,6 +8,60 @@ import ZIPFoundation
 
 @MainActor
 final class EPUBReaderIntegrationTests: XCTestCase {
+    /// 连续开关菜单时正文视口和首个可见文本必须保持不变，防止重新分页造成跳页。
+    func testTogglingControlsKeepsViewportAndVisibleText() async throws {
+        continueAfterFailure = false
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: root) }
+            catch { XCTFail("无法清理 EPUB 回归目录：\(error)") }
+        }
+        let url = root.appendingPathComponent("long.epub")
+        try makeEPUB(at: url, paragraphCount: 80)
+        let report = try LocalBookService().openFile(at: url)
+        let chapter = try XCTUnwrap(report.chapters.first { $0.resourceUrl == "Text/chapter.xhtml" })
+        let model = EPUBReaderModel(book: report.book, chapters: report.chapters, initialIndex: chapter.index)
+        await model.open(preferences: .init(publisherStyles: true))
+        XCTAssertNil(model.errorMessage)
+        let navigator = try XCTUnwrap(model.navigator)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        let library = BookLibraryModel(
+            repository: InMemoryBookRepository(books: [report.book]),
+            localDirectory: root,
+            chapterRepository: InMemoryBookChapterRepository(),
+            progressDefaults: defaults
+        )
+        let reader = EPUBReaderView(model: model)
+            .environmentObject(library)
+            .environmentObject(ReadingActivityModel.demo())
+        let host = UIHostingController(rootView: reader)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        try await waitForJavaScript("!!document.querySelector('#paragraph79')", in: navigator)
+        await model.go(to: ReadiumShared.Link(href: "Text/chapter.xhtml#paragraph20", mediaType: .xhtml))
+        try await waitForLocation("Text/chapter.xhtml", in: model)
+        let originalBounds = navigator.view.bounds
+        let visibleElement = await navigator.firstVisibleElementLocator()
+        let originalVisible = try XCTUnwrap(visibleElement)
+
+        for visible in [false, true, false, true] {
+            model.showsControls = visible
+            // 通过 UIHostingController 的根视图更新执行实际 SwiftUI 布局，不重建导航控制器。
+            host.rootView = reader
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(navigator.view.bounds, originalBounds, "菜单开关不应改变 EPUB 正文视口")
+            let currentElement = await navigator.firstVisibleElementLocator()
+            let currentVisible = try XCTUnwrap(currentElement)
+            XCTAssertEqual(currentVisible.href, originalVisible.href)
+            XCTAssertEqual(currentVisible.text, originalVisible.text, "菜单开关不应改变当前可见文本")
+        }
+    }
+
     func testOriginalCoverStylesImagesTablesAndRestoredLocation() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -61,7 +116,11 @@ final class EPUBReaderIntegrationTests: XCTestCase {
         XCTFail("EPUB content did not render: \(expression)")
     }
 
-    private func makeEPUB(at url: URL) throws {
+    /// 生成包含原书样式和可选长正文的独立 EPUB，供渲染与分页回归使用。
+    private func makeEPUB(at url: URL, paragraphCount: Int = 0) throws {
+        let paragraphs = (0..<paragraphCount).map { index in
+            "<p id=\"paragraph\(index)\">第\(index)段：雨停以后，我们沿着河岸走向灯塔。书页应当保留当前位置，菜单的显示与隐藏不应改变正在阅读的文字。</p>"
+        }.joined()
         let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAEAAAABgCAIAAAAip+O/AAABxklEQVR4nNXCA3YjAABF0becsW12bNdIGptt7Nq2bXeMjc06/j2XI8UG6RwtMUrnWGmtdI6XmaRzotwsnZMVFumcqrRK53SVTTpnqu3SOVvjkM45g1M6540u6VyodUvnoskjnUtmr3QuW3zSuWL1S+eqLSCda/agdK47QtK54QxL56arTjq33PXSue2JSOeONyqdu76YdO7549K5H0hI50EwKZ2HoZR0isJp6Tyqy0jncX1WOk8iOek8jeal8yxWkM7zeIN0XiQapfMy2SSdV6lm6bxOt0jnTaZVOm+zbdJ5l2uXzvt8h3Q+FDql87GhSzqfGrul87mpRzpfmnulU9zSJ52S1n7plLYNSKesfVA65R1D0qnoHJZOZdeIdKq6R6VT3TMmnZrecekY+iakY+yflE7twJR0TIPT0jEPzUjHMjwrHevInHRso/PSsY8tSMcxvigd58SSdFyTy9JxT61IxzO9Kh3vzJp0fLPr0vHPbUgnML8pneDClnRCi9vSCS/tSKdueVc69St70oms7ksnunYgndj6oXTiG1+lk9j8Jp3k1nfppLZ/SCe981M6md1f0snu/ZZObv+PdPIHf6VTOPwn/T/zbe3/96qaXAAAAABJRU5ErkJggg==")!
         let files: [(String, Data)] = [
             ("mimetype", Data("application/epub+zip".utf8)),
@@ -77,7 +136,7 @@ final class EPUBReaderIntegrationTests: XCTestCase {
             <spine><itemref idref="cover"/><itemref idref="body"/></spine></package>
             """.utf8)),
             ("cover.xhtml", Data(##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>封面</title></head><body><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 140"><image xlink:href="Images/cover.png" width="100" height="140"/></svg></body></html>"##.utf8)),
-            ("Text/chapter.xhtml", Data(##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>图文正文</title><link rel="stylesheet" href="../Styles/book.css"/></head><body><h1 id="body">图文正文</h1><p>图片与表格保留在原位置。</p><img id="illustration" src="../Images/cover.png" alt="内嵌插图"/><table><tr><td>项目</td><td>数值</td></tr></table><p><a href="#note">脚注</a></p><aside id="note">脚注内容</aside></body></html>"##.utf8)),
+            ("Text/chapter.xhtml", Data(##"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>图文正文</title><link rel="stylesheet" href="../Styles/book.css"/></head><body><h1 id="body">图文正文</h1><p>图片与表格保留在原位置。</p><img id="illustration" src="../Images/cover.png" alt="内嵌插图"/><table><tr><td>项目</td><td>数值</td></tr></table><p><a href="#note">脚注</a></p><aside id="note">脚注内容</aside>\##(paragraphs)</body></html>"##.utf8)),
             ("nav.xhtml", Data(##"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>目录</title></head><body><nav epub:type="toc"><ol><li><a href="cover.xhtml">封面</a></li><li><a href="Text/chapter.xhtml#body">图文正文</a></li></ol></nav></body></html>"##.utf8)),
             ("Styles/book.css", Data("table { border: 3px solid #123456; } img { max-width: 80%; }".utf8)),
             ("Images/cover.png", png)

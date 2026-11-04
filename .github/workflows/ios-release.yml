@@ -82,6 +82,16 @@ jobs:
             -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tee artifacts/simulator-build.log
 
+      - name: 验证 EPUB 菜单与原排版阅读
+        run: |
+          xcodebuild test -project Legado.xcodeproj -scheme LegadoReaderTests \
+            -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.1' \
+            -derivedDataPath DerivedData \
+            -clonedSourcePackagesDirPath DerivedData/SourcePackages \
+            -disableAutomaticPackageResolution -parallel-testing-enabled NO \
+            -only-testing:LegadoReaderTests/EPUBReaderIntegrationTests \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee artifacts/epub-tests.log
+
       - name: 归档真机架构
         env:
           BUILD_NUMBER: ${{ steps.version.outputs.build }}
