@@ -182,7 +182,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         }
     }
 
-    /// 一个任务按正文顺序填充窗口，当前播放结束后直接消费已经准备的播放器。
+    /// 一个任务按正文顺序填充窗口，渠道恢复后重新准备尚未播放的低优先级缓存。
     private func fillBuffer() {
         guard !stopped, worker == nil else { return }
         let identity = UUID()
@@ -199,14 +199,18 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                         continue
                     }
                     let end = min(units.count, index + aheadCount + 1)
-                    guard let target = (index..<end).first(where: { prepared[units[$0].id] == nil }) else { break }
+                    guard let target = (index..<end).first(where: { needsPreparation(at: $0) }) else { break }
                     let unit = units[target]
                     generationStatus = "正在生成\(target == index ? "当前" : "后续第 \(target - index)")份缓存"
                     publishStatus()
                     let value = try await synthesize(unit)
                     try Task.checkCancellation()
-                    if target >= index { prepared[unit.id] = value }
-                    else { removeFile(value.fileURL) }
+                    if target > index || (target == index && player == nil) {
+                        if let previous = prepared[unit.id] { removeFile(previous.fileURL) }
+                        prepared[unit.id] = value
+                    } else {
+                        removeFile(value.fileURL)
+                    }
                     generationStatus = ""
                     playIfReady()
                 }
@@ -219,6 +223,14 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                 publishStatus()
             }
         }
+    }
+
+    /// 缺失音频或备用渠道缓存尚未切回已恢复的首选渠道时，需要补充相应缓存。
+    private func needsPreparation(at target: Int) -> Bool {
+        guard let value = prepared[units[target].id] else { return true }
+        guard target > index, let preferred = channels.firstIndex(where: { failedUntil[$0.id] == nil }),
+              let actual = channels.firstIndex(where: { $0.id == value.engine.id }) else { return false }
+        return preferred < actual
     }
 
     /// 从高优先级渠道合成；失败保留同一份正文，全部失败则等到明确的重试时间。

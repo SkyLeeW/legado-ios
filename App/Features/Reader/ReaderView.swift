@@ -62,6 +62,7 @@ struct ReaderView: View {
     @State private var speechLastPlannedChapter = 0
     @State private var activeSpeechCacheUnit = "characters"
     @State private var activeSpeechCacheCharacters = 1000
+    @State private var speechChapterCache: [Int: ReaderScrollChapter] = [:]
     @State private var speechTimerRemaining = 0
     @State private var isSavingBookmark = false
     @ScaledMetric(relativeTo: .body) private var toolbarIconSize = 21
@@ -2065,6 +2066,7 @@ struct ReaderView: View {
             speechLastPlannedChapter = model.currentIndex
             activeSpeechCacheUnit = ttsCacheUnit
             activeSpeechCacheCharacters = ttsCacheCharacters
+            speechChapterCache = [model.currentIndex: .init(id: model.currentIndex, title: model.title, content: model.content)]
             resumesSpeechAfterChapterLoad = false
             speech.speakHTTPContinuously(engine: engine, units: makeHTTPUnits(
                 index: model.currentIndex, title: model.title, content: model.content, position: readerPosition
@@ -2155,6 +2157,7 @@ struct ReaderView: View {
                     guard speech.httpSessionID == session else { return }
                     guard let chapter else { speech.finishHTTPPlanning(); return }
                     speechLastPlannedChapter = chapter.id
+                    speechChapterCache[chapter.id] = chapter
                     speech.appendHTTPUnits(makeHTTPUnits(index: chapter.id, title: chapter.title, content: chapter.content))
                 }
             } catch is CancellationError {
@@ -2168,12 +2171,13 @@ struct ReaderView: View {
 
     /// 音频开始播放后才同步章节；仅在用户开启跟随且位置离开当前页时翻页。
     private func followHTTPAudio(_ unit: ReaderHTTPSpeechUnit) {
+        guard ttsFollowAudio else { return }
         if unit.chapterIndex != model.currentIndex {
             saveProgress(immediate: true)
-            model.select(index: unit.chapterIndex, position: unit.position)
+            model.selectSpeechChapter(speechChapterCache[unit.chapterIndex]!, position: unit.position)
             readerPosition = unit.position
             readerJumpPosition = nil
-        } else if ttsFollowAudio {
+        } else {
             let pageIndex = currentPage - 1
             if readerPageRanges.indices.contains(pageIndex), NSLocationInRange(unit.position, readerPageRanges[pageIndex]) { return }
             readerJumpPosition = unit.position
@@ -2194,14 +2198,18 @@ struct ReaderView: View {
         readerPosition = model.requestedPosition
     }
 
+    /// 媒体章节按钮依据实际正在朗读的章节导航，不受关闭画面跟随后停留的页面影响。
     private func moveSpeechToChapter(direction: Int) {
-        let canMove = direction < 0 ? model.canGoPrevious : model.canGoNext
-        guard canMove else { return }
+        let current = speech.currentHTTPUnit?.chapterIndex ?? model.currentIndex
+        let target = direction < 0
+            ? model.chapters.indices.last(where: { $0 < current && !model.chapters[$0].isVolume })
+            : model.chapters.indices.first(where: { $0 > current && !model.chapters[$0].isVolume })
+        guard let target else { return }
         speech.stop()
         saveProgress(immediate: true)
         resumesSpeechAfterChapterLoad = true
         readerJumpPosition = nil
-        if direction < 0 { model.goPrevious() } else { model.goNext() }
+        model.select(index: target)
         readerPosition = model.requestedPosition
     }
 

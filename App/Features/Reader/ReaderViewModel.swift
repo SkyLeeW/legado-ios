@@ -539,6 +539,16 @@ final class ReaderViewModel: ObservableObject {
         chapterLoadGeneration &+= 1
     }
 
+    /// 听书已加载的章节直接用于显示，同一次界面更新中保留完整正文而不再次等待读取。
+    func selectSpeechChapter(_ chapter: ReaderScrollChapter, position: Int) {
+        select(index: chapter.id, position: position)
+        title = chapter.title
+        content = chapter.content
+        paragraphs = Self.makeParagraphs(chapter.content)
+        loadedFromCache = true
+        hasLoadedCurrentChapter = true
+    }
+
     private func clearAdjacentChapters() {
         clearContinuousReading()
         previousLoadedIndex = nil
