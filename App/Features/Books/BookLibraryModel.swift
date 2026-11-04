@@ -112,7 +112,16 @@ final class BookLibraryModel: ObservableObject {
         do {
             async let storedBooks = repository.load()
             async let storedGroups = groupRepository.load()
-            books = try await storedBooks
+            let loadedBooks = try await storedBooks
+            // 只迁移本地文件位置，保留书籍主键、目录关联和原阅读进度。
+            books = loadedBooks.map { original in
+                var book = original
+                if book.origin == "local", book.localFilePath == nil, let url = URL(string: book.bookUrl), url.isFileURL {
+                    book.localFilePath = LocalBookService.managedRelativePath(for: url)
+                }
+                return book
+            }
+            if books != loadedBooks { try await repository.save(books) }
             persistedBooks = books
             groups = try await storedGroups
             persistedGroups = groups
@@ -120,8 +129,9 @@ final class BookLibraryModel: ObservableObject {
                 await persistGroups([.init(groupId: BookGroup.idAll, groupName: "全部", order: 0)])
             }
             for book in books where book.origin == "local" && book.coverUrl?.isEmpty != false {
-                guard !Task.isCancelled, let url = URL(string: book.bookUrl),
-                      url.isFileURL, url.pathExtension.lowercased() == "epub" else { continue }
+                guard !Task.isCancelled else { return }
+                let url = try LocalBookService.fileURL(for: book)
+                guard url.pathExtension.lowercased() == "epub" else { continue }
                 if let cover = try? await Task.detached(priority: .utility, operation: { [localService] in
                     try localService.loadCover(at: url)
                 }).value {
@@ -414,10 +424,18 @@ final class BookLibraryModel: ObservableObject {
     }
 
     func addLocalFile(at url: URL) async throws {
-        guard !books.contains(where: { $0.bookUrl == url.absoluteString }) else { return }
+        guard try !books.contains(where: { book in
+            if book.origin != "local" { return false }
+            return try LocalBookService.fileURL(for: book) == url
+        }) else { return }
         let report = try await Task.detached { [localService] in try localService.openFile(at: url) }.value
-        guard !books.contains(where: { $0.bookUrl == url.absoluteString }) else { return }
-        guard await persist(books + [report.book]) else {
+        guard try !books.contains(where: { book in
+            if book.origin != "local" { return false }
+            return try LocalBookService.fileURL(for: book) == url
+        }) else { return }
+        var imported = report.book
+        imported.localFilePath = LocalBookService.managedRelativePath(for: url)
+        guard await persist(books + [imported]) else {
             throw LocalFileError.saveFailed(errorMessage ?? "无法写入数据库")
         }
     }
@@ -426,25 +444,36 @@ final class BookLibraryModel: ObservableObject {
         let target = try await localFiles.rename(url, to: name)
         guard target != url else { return }
         var updated = books
-        for index in updated.indices where updated[index].origin == "local" && updated[index].bookUrl == url.absoluteString {
+        var renamedIDs: [String] = []
+        for index in updated.indices where updated[index].origin == "local" {
+            if try LocalBookService.fileURL(for: updated[index]) != url { continue }
+            renamedIDs.append(updated[index].bookUrl)
             updated[index].bookUrl = target.absoluteString
+            updated[index].localFilePath = LocalBookService.managedRelativePath(for: target)
             updated[index].originName = target.lastPathComponent
         }
         guard await persist(updated) else {
             _ = try await localFiles.rename(target, to: url.lastPathComponent)
             throw LocalFileError.saveFailed(errorMessage ?? "无法写入数据库")
         }
-        if let progress = pendingProgress.removeValue(forKey: url.absoluteString) {
-            pendingProgress[target.absoluteString] = progress
-            persistPendingProgress()
+        for id in renamedIDs {
+            if let progress = pendingProgress.removeValue(forKey: id) {
+                pendingProgress[target.absoluteString] = progress
+            }
+            try await chapterRepository.remove(bookURL: id)
         }
-        try? await chapterRepository.remove(bookURL: url.absoluteString)
+        persistPendingProgress()
     }
 
     func deleteLocalFile(at url: URL) async throws {
+        let removed = try books.filter { book in
+            if book.origin != "local" { return false }
+            return try LocalBookService.fileURL(for: book) == url
+        }
+        let removedIDs = Set(removed.map(\.bookUrl))
         let staged: StagedLocalFile?
         if url.isFileURL,
-           books.contains(where: { $0.origin == "local" && $0.bookUrl == url.absoluteString }),
+           !removed.isEmpty,
            !FileManager.default.fileExists(atPath: url.path) {
             // Stale shelf paths can belong to a previous app container. Only
             // remove their metadata; existing files still require containment.
@@ -452,13 +481,13 @@ final class BookLibraryModel: ObservableObject {
         } else {
             staged = try await localFiles.stageRemoval(url)
         }
-        guard await persist(books.filter { $0.bookUrl != url.absoluteString }) else {
+        guard await persist(books.filter { !removedIDs.contains($0.bookUrl) }) else {
             if let staged { try await localFiles.restore(staged) }
             throw LocalFileError.saveFailed(errorMessage ?? "无法写入数据库")
         }
-        pendingProgress[url.absoluteString] = nil
+        for id in removedIDs { pendingProgress[id] = nil }
         persistPendingProgress()
-        try? await chapterRepository.remove(bookURL: url.absoluteString)
+        for id in removedIDs { try await chapterRepository.remove(bookURL: id) }
         if let staged { try await localFiles.finishRemoval(staged) }
     }
 

@@ -2,6 +2,8 @@ import Foundation
 
 public struct Book: Codable, Hashable, Identifiable, Sendable {
     public var bookUrl: String
+    /// 导入文件相对于本地书目录的位置，避免自签覆盖安装后依赖旧沙盒路径。
+    public var localFilePath: String?
     public var tocUrl: String
     public var origin: String
     public var originName: String
@@ -78,12 +80,13 @@ public struct Book: Codable, Hashable, Identifiable, Sendable {
         case intro, customIntro, charset, type, group, latestChapterTitle, latestChapterTime, lastCheckTime
         case lastCheckCount, totalChapterNum, durChapterTitle, durChapterIndex, durVolumeIndex
         case chapterInVolumeIndex, durChapterPos, durChapterTime, wordCount, canUpdate, order, originOrder
-        case variable, readConfig, syncTime
+        case variable, readConfig, syncTime, localFilePath
     }
 
     public init(from decoder: Decoder) throws {
         let value = try decoder.container(keyedBy: CodingKeys.self)
         bookUrl = try value.decodeIfPresent(String.self, forKey: .bookUrl) ?? ""
+        localFilePath = try value.decodeIfPresent(String.self, forKey: .localFilePath)
         tocUrl = try value.decodeIfPresent(String.self, forKey: .tocUrl) ?? ""
         origin = try value.decodeIfPresent(String.self, forKey: .origin) ?? "local"
         originName = try value.decodeIfPresent(String.self, forKey: .originName) ?? ""

@@ -106,12 +106,12 @@ struct MiMoTTSService: Sendable {
     let apiKey: @Sendable (Int64) throws -> String?
 
     /// 每次合成只请求一次，服务端失败与解析失败均交由听书界面显示。
-    func audio(engineID: Int64, configuration: MiMoTTSConfiguration, text: String) async throws -> HttpTTSAudio {
+    func audio(engineID: Int64, configuration: MiMoTTSConfiguration, text: String, timeout: TimeInterval = 300) async throws -> HttpTTSAudio {
         guard let key = try apiKey(engineID) else { throw MiMoTTSError.missingAPIKey }
         try Task.checkCancellation()
         var request = URLRequest(url: MiMoTTSConfiguration.endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 300
+        request.timeoutInterval = timeout
         request.setValue(key, forHTTPHeaderField: "api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(Request(

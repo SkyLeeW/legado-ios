@@ -111,6 +111,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     @Published private(set) var errorMessage: String?
     @Published private(set) var completionCount = 0
     @Published private(set) var currentSegmentIndex = 0
+    @Published private(set) var channelStatus = ""
     private let synthesizer = AVSpeechSynthesizer()
     private let httpService = HttpTTSService()
     private var audioPlayer: AVAudioPlayer?
@@ -123,6 +124,16 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     private var httpSegmentIndex = 0
     private var httpEngine: HttpTTS?
     private var httpCachePolicy: HttpTTSCachePolicy = .useCache
+    private var configuredBackupEngines: [HttpTTS] = []
+    private var usesChannelFailover = false
+    private var httpChannels: [HttpTTS] = []
+    private var failedChannels: [Int64: Date] = [:]
+    private var channelErrors: [Int64: String] = [:]
+    private var channelFailureVersions: [Int64: UUID] = [:]
+    private var recoveryTask: Task<Void, Never>?
+    private var httpSession = UUID()
+    private var isRoutingChannels = false
+    private let recoveryInterval: TimeInterval = 60
     private var systemSegments: [String] = []
     private var systemSegmentIndex = 0
     private var segmentIndexOffset = 0
@@ -175,6 +186,13 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     }
 
     func stop() {
+        // 换书、停止和关闭页面时作废当前会话，取消请求与恢复探测。
+        httpSession = UUID()
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        httpChannels = []
+        isRoutingChannels = false
+        channelStatus = ""
         synthesizer.stopSpeaking(at: .word)
         audioPlayer?.stop()
         audioPlayer = nil
@@ -214,7 +232,9 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         mediaButtonPerNext: Bool = false,
         bookName: String = "",
         chapterTitle: String = "",
-        author: String = ""
+        author: String = "",
+        usesChannelFailover: Bool = false,
+        backupEngines: [HttpTTS] = []
     ) {
         self.followsSystemRate = followsSystemRate
         self.speechRate = min(max(speechRate, 0), 45)
@@ -227,6 +247,8 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         self.bookName = bookName
         self.chapterTitle = chapterTitle
         self.author = author
+        self.usesChannelFailover = usesChannelFailover
+        configuredBackupEngines = backupEngines
     }
 
     func speak(_ text: String, continuesAcrossChapters: Bool = false, segmentIndexOffset: Int = 0) {
@@ -259,11 +281,17 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         self.continuesAcrossChapters = continuesAcrossChapters
         httpEngine = engine
         httpCachePolicy = cachePolicy
+        // 试听强制验证指定渠道，日常听书才启用用户选择的备用渠道。
+        if case .useCache = cachePolicy, usesChannelFailover {
+            isRoutingChannels = true
+            httpChannels = [engine] + configuredBackupEngines.filter { $0.id != engine.id }
+        }
         httpSegments = segments(for: text)
         guard !httpSegments.isEmpty else { return }
         httpSegmentIndex = 0
         self.segmentIndexOffset = max(segmentIndexOffset, 0)
         isSpeaking = true
+        if isRoutingChannels { startChannelRecovery() }
         playCurrentHTTPSegment()
         prefetchHTTP(engine: engine, texts: Array(httpSegments.dropFirst()))
     }
@@ -284,16 +312,10 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     }
 
     func pauseOrResumeHTTP(engine: HttpTTS, text: String, continuesAcrossChapters: Bool = false) {
-        if audioPlayer != nil {
-            pauseOrResume(text: text, continuesAcrossChapters: continuesAcrossChapters)
+        if isPaused {
+            resumePlayback()
         } else if isSpeaking {
-            httpTask?.cancel()
-            isSpeaking = false
-            isPaused = true
-        } else if isPaused, httpEngine != nil {
-            isPaused = false
-            isSpeaking = true
-            playCurrentHTTPSegment()
+            pausePlayback()
         } else {
             speakHTTP(engine: engine, text: text, continuesAcrossChapters: continuesAcrossChapters)
         }
@@ -325,6 +347,8 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         }
         isPaused = true
         isSpeaking = false
+        recoveryTask?.cancel()
+        recoveryTask = nil
         updateNowPlaying()
     }
 
@@ -345,6 +369,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
             return
         }
         isPaused = false
+        if isRoutingChannels, recoveryTask == nil { startChannelRecovery() }
         updateNowPlaying()
     }
 
@@ -522,6 +547,10 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     }
 
     private func playCurrentHTTPSegment() {
+        if isRoutingChannels {
+            playRoutedHTTPSegment()
+            return
+        }
         guard let engine = httpEngine, httpSegments.indices.contains(httpSegmentIndex) else {
             stop()
             return
@@ -561,12 +590,14 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         }
     }
 
+    /// 只有播放器确认能开始播放时才将该段标记为播放中。
     private func playBufferedHTTPAudio(_ data: Data) throws {
         let player = try AVAudioPlayer(data: data)
         player.delegate = self
-        player.prepareToPlay()
+        guard player.prepareToPlay() else { throw CocoaError(.fileReadCorruptFile) }
         audioPlayer = player
-        isSpeaking = player.play()
+        guard player.play() else { throw CocoaError(.fileReadCorruptFile) }
+        isSpeaking = true
     }
 
     private func playIncrementalHTTPStream(_ stream: HttpTTSAudioStream) {
@@ -600,6 +631,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     private func prefetchHTTP(engine: HttpTTS, texts: [String]) {
         // MiMo 按实际播放段落合成，不对未收听内容发起计费请求。
         if engine.mimo != nil { return }
+        if usesChannelFailover { return }
         guard !texts.isEmpty else { return }
         let rate = speechRate + 5
         let task = Task { [weak self] in
@@ -613,8 +645,14 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === audioPlayer else { return }
         audioPlayer = nil
         guard flag else {
+            if isRoutingChannels, let engine = httpEngine {
+                recordChannelFailure(engine, error: CocoaError(.fileReadCorruptFile))
+                playCurrentHTTPSegment()
+                return
+            }
             errorMessage = "HTTP TTS 音频播放失败"
             stop()
             return
@@ -624,6 +662,123 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
             playCurrentHTTPSegment()
         } else {
             finishNaturally()
+        }
+    }
+
+    /// 渠道失败进入定时重试状态，保留明确错误供设置页面查看。
+    private func recordChannelFailure(_ engine: HttpTTS, error: Error) {
+        failedChannels[engine.id] = Date().addingTimeInterval(recoveryInterval)
+        channelFailureVersions[engine.id] = UUID()
+        channelErrors[engine.id] = "\(engine.name)：\(error.localizedDescription)"
+        errorMessage = httpChannels.compactMap { channelErrors[$0.id] }.joined(separator: "\n")
+        channelStatus = "\(engine.name) 失败，正在切换渠道"
+    }
+
+    /// 始终从优先级最高的可用渠道合成当前段，全不可用时按恢复时间等待后继续。
+    private func playRoutedHTTPSegment() {
+        let index = httpSegmentIndex
+        let text = httpSegments[index]
+        let session = httpSession
+        currentSegmentIndex = segmentIndexOffset + index
+        httpTask?.cancel()
+        httpTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                while true {
+                    try Task.checkCancellation()
+                    for engine in httpChannels {
+                        if let nextRetry = failedChannels[engine.id], nextRetry > Date() { continue }
+                        do {
+                            channelStatus = "正在使用 \(engine.name)"
+                            let audio = try await httpService.audio(
+                                engine: engine, text: text, speechRate: speechRate + 5,
+                                cachePolicy: failedChannels[engine.id] == nil ? .useCache : .reload,
+                                maximumAttempts: 1, timeout: 20
+                            )
+                            try Task.checkCancellation()
+                            guard session == httpSession else { return }
+                            try playBufferedHTTPAudio(audio.data)
+                            failedChannels[engine.id] = nil
+                            channelErrors[engine.id] = nil
+                            channelFailureVersions[engine.id] = UUID()
+                            httpEngine = engine
+                            channelStatus = "当前渠道：\(engine.name)"
+                            errorMessage = httpChannels.compactMap { channelErrors[$0.id] }.joined(separator: "\n")
+                            if errorMessage == "" { errorMessage = nil }
+                            isPaused = false
+                            updateNowPlaying()
+                            return
+                        } catch {
+                            try Task.checkCancellation()
+                            guard session == httpSession else { return }
+                            audioPlayer?.stop()
+                            audioPlayer = nil
+                            recordChannelFailure(engine, error: error)
+                        }
+                    }
+                    channelStatus = "全部渠道暂不可用，等待自动重试"
+                    // 每次请求结束都会更新失败期限，避免对失效渠道无间隔循环请求。
+                    let nextRetry = httpChannels.compactMap { failedChannels[$0.id] }.min()!
+                    let delay = max(nextRetry.timeIntervalSinceNow, 0)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                errorMessage = error.localizedDescription
+                stop()
+            }
+        }
+    }
+
+    /// 播放备用渠道期间探测失败的更高优先级渠道，恢复结果仅在下一段选择时生效。
+    private func startChannelRecovery() {
+        let session = httpSession
+        recoveryTask = Task { [weak self] in
+            do {
+                while true {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    guard let self, session == self.httpSession else { return }
+                    if self.isPaused || self.audioPlayer == nil { continue }
+                    let activeIndex = self.httpChannels.firstIndex { $0.id == self.httpEngine?.id }!
+                    for engine in self.httpChannels.prefix(activeIndex) {
+                        guard let nextRetry = self.failedChannels[engine.id], nextRetry <= Date() else { continue }
+                        // 用真实下一段探测并写入缓存，切回时可以直接播放，避免额外合成测试文本。
+                        let nextIndex = self.httpSegmentIndex + 1
+                        if nextIndex >= self.httpSegments.count { break }
+                        let text = self.httpSegments[nextIndex]
+                        let version = self.channelFailureVersions[engine.id]
+                        self.failedChannels[engine.id] = Date().addingTimeInterval(self.recoveryInterval)
+                        do {
+                            let audio = try await self.httpService.audio(
+                                engine: engine, text: text, speechRate: self.speechRate + 5,
+                                cachePolicy: .reload, maximumAttempts: 1, timeout: 20
+                            )
+                            try Task.checkCancellation()
+                            guard session == self.httpSession else { return }
+                            // 若播放请求期间记录了新的失败，本次旧探测无权覆盖较新的渠道状态。
+                            if version != self.channelFailureVersions[engine.id] { continue }
+                            let player = try AVAudioPlayer(data: audio.data)
+                            guard player.prepareToPlay() else { throw CocoaError(.fileReadCorruptFile) }
+                            self.failedChannels[engine.id] = nil
+                            self.channelErrors[engine.id] = nil
+                            self.channelFailureVersions[engine.id] = UUID()
+                            self.errorMessage = self.httpChannels.compactMap { self.channelErrors[$0.id] }.joined(separator: "\n")
+                            if self.errorMessage == "" { self.errorMessage = nil }
+                            self.channelStatus = "\(engine.name) 已恢复，将在下一段切回"
+                        } catch {
+                            try Task.checkCancellation()
+                            guard session == self.httpSession else { return }
+                            if version != self.channelFailureVersions[engine.id] { continue }
+                            self.recordChannelFailure(engine, error: error)
+                        }
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 

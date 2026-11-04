@@ -91,6 +91,39 @@ private struct TxtHeadingMatch {
 }
 
 public struct LocalBookService: Sendable {
+    /// 每次从系统获取当前数据目录，不持久化会随安装变化的沙盒根路径。
+    public static var managedDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Legado/LocalBooks", isDirectory: true)
+    }
+
+    /// 提取已知托管目录后的完整相对路径，不按文件名搜索或猜测其他文件。
+    public static func managedRelativePath(for source: URL) -> String? {
+        let components = source.standardizedFileURL.pathComponents
+        let root = ["Library", "Application Support", "Legado", "LocalBooks"]
+        for index in components.indices where components[index] == "Library" {
+            if Array(components.dropFirst(index).prefix(root.count)) == root {
+                return components.dropFirst(index + root.count).joined(separator: "/")
+            }
+        }
+        return nil
+    }
+
+    /// 将托管文件的原相对位置映射到当前沙盒，外部文件地址不参与重定位。
+    public static func resolvedManagedURL(_ source: URL) -> URL {
+        if let path = managedRelativePath(for: source) {
+            return managedDirectory.appendingPathComponent(path)
+        }
+        return source
+    }
+
+    /// 书籍标识继续用于进度关联，实际读取使用当前沙盒中的相对文件位置。
+    public static func fileURL(for book: Book) throws -> URL {
+        if let path = book.localFilePath { return managedDirectory.appendingPathComponent(path) }
+        guard let source = URL(string: book.bookUrl), source.isFileURL else { throw LocalBookError.missingFile }
+        return resolvedManagedURL(source)
+    }
+
     public var maximumFileSize: Int64
     public var tocRules: [TxtTocRule]
     private var loadsLiveTocRules = false
@@ -141,7 +174,8 @@ public struct LocalBookService: Sendable {
     }
 
     public func loadIllustrations(book: Book, chapter: BookChapter) throws -> [EPUBIllustration] {
-        guard let url = URL(string: book.bookUrl), url.isFileURL, url.pathExtension.lowercased() == "epub" else { return [] }
+        let url = try Self.fileURL(for: book)
+        guard url.pathExtension.lowercased() == "epub" else { return [] }
         try validateFile(url)
         return try EPUBBook(url: url).illustrations(chapter: chapter)
     }
@@ -230,7 +264,8 @@ public struct LocalBookService: Sendable {
     }
 
     public func loadChapters(book: Book) throws -> ChapterListReport {
-        if let url = URL(string: book.bookUrl), url.isFileURL, url.pathExtension.lowercased() == "epub" {
+        let url = try Self.fileURL(for: book)
+        if url.pathExtension.lowercased() == "epub" {
             try validateFile(url)
             return try .init(chapters: EPUBBook(url: url).chapters(book: book))
         }
@@ -254,12 +289,12 @@ public struct LocalBookService: Sendable {
     }
 
     public func loadContent(book: Book, chapter: BookChapter) throws -> ChapterContentReport {
-        if let url = URL(string: book.bookUrl), url.isFileURL, url.pathExtension.lowercased() == "epub" {
+        let url = try Self.fileURL(for: book)
+        if url.pathExtension.lowercased() == "epub" {
             try validateFile(url)
             return try EPUBBook(url: url).content(chapter: chapter)
         }
-        guard let url = URL(string: book.bookUrl), url.isFileURL,
-              FileManager.default.fileExists(atPath: url.path) else { throw LocalBookError.missingFile }
+        try validateFile(url)
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let start = max(Int(chapter.start ?? 0), 0)
         let end = min(Int(chapter.end ?? Int64(fileSize)), fileSize)
@@ -286,8 +321,8 @@ public struct LocalBookService: Sendable {
     }
 
     private func read(_ book: Book) throws -> (charset: String, encoding: String.Encoding, bomLength: Int, data: Data) {
-        guard let url = URL(string: book.bookUrl), url.isFileURL,
-              FileManager.default.fileExists(atPath: url.path) else { throw LocalBookError.missingFile }
+        let url = try Self.fileURL(for: book)
+        try validateFile(url)
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         if let charset = book.charset, let encoding = encoding(named: charset) {
             return (charset, encoding, bomLength(in: data, encoding: encoding), data)

@@ -54,8 +54,8 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
         errorMessage = nil
         defer { isLoading = false }
         do {
-            guard let url = URL(string: book.bookUrl), url.isFileURL,
-                  let file = FileURL(url: url) else { throw LocalBookError.missingFile }
+            let url = try LocalBookService.fileURL(for: book)
+            guard let file = FileURL(url: url) else { throw LocalBookError.missingFile }
             let retriever = AssetRetriever(httpClient: httpClient)
             let opener = PublicationOpener(parser: DefaultPublicationParser(
                 httpClient: httpClient, assetRetriever: retriever, pdfFactory: DefaultPDFDocumentFactory()

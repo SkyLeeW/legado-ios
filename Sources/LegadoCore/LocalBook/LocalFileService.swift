@@ -137,7 +137,7 @@ public actor BookFileExporter {
     public func originalFile(_ source: URL, filename: String) throws -> BookFileExport {
         let target = try destination(filename: filename, extension: source.pathExtension.lowercased())
         do {
-            try FileManager.default.copyItem(at: source, to: target)
+            try FileManager.default.copyItem(at: LocalBookService.resolvedManagedURL(source), to: target)
             return .init(url: target, cachedChapters: 0, totalChapters: 0)
         } catch {
             try? FileManager.default.removeItem(at: target.deletingLastPathComponent())

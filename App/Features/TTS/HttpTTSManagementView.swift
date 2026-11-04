@@ -116,6 +116,7 @@ struct HttpTTSManagementView: View {
     @State private var editing: HttpTTS?
     @State private var importsFile = false
     @State private var exportsFile = false
+    @State private var showsFailoverSettings = false
     @State private var exportDocument = HttpTTSJSONDocument(data: Data("[]".utf8))
 
     var body: some View {
@@ -145,6 +146,7 @@ struct HttpTTSManagementView: View {
                     Button("自定义 HTTP 引擎") { editing = HttpTTS() }
                 }
                 Menu("更多", systemImage: "ellipsis.circle") {
+                    Button("渠道自动切换", systemImage: "arrow.triangle.swap") { showsFailoverSettings = true }
                     Button("导入", systemImage: "square.and.arrow.down") { importsFile = true }
                     Button("导出", systemImage: "square.and.arrow.up") {
                         do {
@@ -162,6 +164,9 @@ struct HttpTTSManagementView: View {
             }
         }
         .task { await model.load() }
+        .sheet(isPresented: $showsFailoverSettings) {
+            ReadingNavigationStack { HttpTTSFailoverSettingsView(engines: model.engines) }
+        }
         .sheet(item: $editing) { engine in
             ReadingNavigationStack {
                 if let configuration = engine.mimo {
@@ -200,6 +205,67 @@ struct HttpTTSManagementView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+    }
+}
+
+/// 备用渠道必须由用户明确选择，排序决定失败后的切换与恢复优先级。
+private struct HttpTTSFailoverSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let engines: [HttpTTS]
+    @AppStorage("ttsFailoverEnabled") private var enabled = false
+    @State private var order: [String] = []
+
+    /// 按用户保存的顺序解析仍存在的备用渠道，不把内置引擎自动加入切换链。
+    private var selected: [HttpTTS] {
+        order.compactMap { id in engines.first { String($0.id) == id } }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Toggle("失败后自动切换渠道", isOn: $enabled)
+            } footer: {
+                Text("先使用阅读页选中的渠道，失败后按下方顺序使用备用渠道。每 60 秒探测一次已失败的高优先级渠道，恢复后在下一段切回。所有渠道不可用时保留当前段落并等待重试。")
+            }
+            Section("备用顺序（拖动调整）") {
+                ForEach(selected) { engine in Text(engine.name) }
+                    .onMove { source, destination in
+                        var ids = selected.map { String($0.id) }
+                        ids.move(fromOffsets: source, toOffset: destination)
+                        save(ids)
+                    }
+                    .onDelete { offsets in
+                        var ids = selected.map { String($0.id) }
+                        ids.remove(atOffsets: offsets)
+                        save(ids)
+                    }
+            }
+            Section("可用渠道") {
+                ForEach(engines) { engine in
+                    Toggle(engine.name, isOn: Binding(
+                        get: { order.contains(String(engine.id)) },
+                        set: { included in
+                            let id = String(engine.id)
+                            save(included ? order + [id] : order.filter { $0 != id })
+                        }
+                    ))
+                }
+            }
+            Section {
+                Text("恢复探测使用真实下一段正文，付费渠道可能计费。自动切换使用完整音频合成，每次请求最长等待 20 秒；试听不切换渠道。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("渠道自动切换")
+        .environment(\.editMode, .constant(.active))
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+        .onAppear { order = UserDefaults.standard.stringArray(forKey: "ttsFailoverOrder") ?? [] }
+    }
+
+    /// 每次选择与排序立即持久化，避免关闭配置页后丢失备用链。
+    private func save(_ ids: [String]) {
+        order = ids
+        UserDefaults.standard.set(ids, forKey: "ttsFailoverOrder")
     }
 }
 

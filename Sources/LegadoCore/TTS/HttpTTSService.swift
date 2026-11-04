@@ -130,7 +130,7 @@ public actor HttpTTSService {
     }
 
     /// 按配置渠道合成可播放音频，试听时跳过已有缓存以验证实际请求。
-    public func audio(engine: HttpTTS, text: String, speechRate: Int, cachePolicy: HttpTTSCachePolicy = .useCache) async throws -> HttpTTSAudio {
+    public func audio(engine: HttpTTS, text: String, speechRate: Int, cachePolicy: HttpTTSCachePolicy = .useCache, maximumAttempts: Int = 6, timeout: TimeInterval = 300) async throws -> HttpTTSAudio {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw HttpTTSServiceError.emptyText }
         let source = engine.bookSourceAdapter
@@ -140,7 +140,7 @@ public actor HttpTTSService {
         }
         // MiMo 返回 JSON 包装的音频，由渠道协议解析后再缓存实际 WAV 数据。
         if let configuration = engine.mimo {
-            let audio = try await miMoService.audio(engineID: engine.id, configuration: configuration, text: text)
+            let audio = try await miMoService.audio(engineID: engine.id, configuration: configuration, text: text, timeout: timeout)
             await cache.store(audio.data, for: cacheKey)
             return audio
         }
@@ -153,31 +153,34 @@ public actor HttpTTSService {
             source: source
         )
         var lastError: Error = HttpTTSServiceError.emptyText
-        for attempt in 0..<6 {
+        for attempt in 0..<maximumAttempts {
             try Task.checkCancellation()
             do {
-                let prepared = try urlBuilder.prepare(
+                var prepared = try urlBuilder.prepare(
                     engine.url,
                     context: context,
                     defaultHeaders: try BookSourceHeaderResolver().resolve(source)
                 )
+                // 自动切换请求由渠道状态机安排重试，不叠加规则内的网络重试次数。
+                if maximumAttempts == 1 { prepared.retry = 0 }
                 var response = try await networkPolicy.execute(
                     prepared,
                     source: source,
                     transport: transport,
-                    timeout: 300
+                    timeout: timeout
                 )
                 if try evaluateLoginCheckIfNeeded(engine: engine, source: source, response: response) {
-                    let rebuilt = try urlBuilder.prepare(
+                    var rebuilt = try urlBuilder.prepare(
                         engine.url,
                         context: context,
                         defaultHeaders: try BookSourceHeaderResolver().resolve(source)
                     )
+                    if maximumAttempts == 1 { rebuilt.retry = 0 }
                     response = try await networkPolicy.execute(
                         rebuilt,
                         source: source,
                         transport: transport,
-                        timeout: 300
+                        timeout: timeout
                     )
                 }
                 let contentType = response.headers.first {
@@ -190,16 +193,17 @@ public actor HttpTTSService {
                 throw CancellationError()
             } catch HTTPClientError.statusResponse(let response) {
                 if try evaluateLoginCheckIfNeeded(engine: engine, source: source, response: response) {
-                    let rebuilt = try urlBuilder.prepare(
+                    var rebuilt = try urlBuilder.prepare(
                         engine.url,
                         context: context,
                         defaultHeaders: try BookSourceHeaderResolver().resolve(source)
                     )
+                    if maximumAttempts == 1 { rebuilt.retry = 0 }
                     let recovered = try await networkPolicy.execute(
                         rebuilt,
                         source: source,
                         transport: transport,
-                        timeout: 300
+                        timeout: timeout
                     )
                     let contentType = Self.contentType(from: recovered.headers)
                     try validateContentType(engine: engine, response: recovered, contentType: contentType)
@@ -207,12 +211,12 @@ public actor HttpTTSService {
                     return .init(data: recovered.data, contentType: contentType, finalURL: recovered.finalURL)
                 }
                 lastError = HTTPClientError.statusResponse(response)
-                if attempt == 5 { throw lastError }
+                if attempt + 1 == maximumAttempts { throw lastError }
             } catch let error as RuleEngineError {
                 throw error
             } catch {
                 lastError = error
-                if attempt == 5 { throw error }
+                if attempt + 1 == maximumAttempts { throw error }
             }
         }
         throw lastError

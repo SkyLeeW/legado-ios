@@ -1660,6 +1660,7 @@ struct ReaderView: View {
                             .font(.footnote.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
+                    if !speech.channelStatus.isEmpty { Text(speech.channelStatus).font(.footnote) }
                     if let error = speech.errorMessage {
                         Text(error).font(.footnote).foregroundStyle(.red)
                     }
@@ -2160,7 +2161,11 @@ struct ReaderView: View {
             mediaButtonPerNext: mediaButtonPerNext,
             bookName: model.book.name,
             chapterTitle: model.title,
-            author: model.book.author
+            author: model.book.author,
+            usesChannelFailover: UserDefaults.standard.bool(forKey: "ttsFailoverEnabled"),
+            backupEngines: (UserDefaults.standard.stringArray(forKey: "ttsFailoverOrder") ?? []).compactMap { id in
+                httpTTSEngines.first { String($0.id) == id }
+            }
         )
     }
 
