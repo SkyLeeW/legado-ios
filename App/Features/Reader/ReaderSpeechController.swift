@@ -66,6 +66,12 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private var worker: Task<Void, Never>?
     private var workerID = UUID()
     private var recoveryTimer: Task<Void, Never>?
+    private var recoveryProbe: Task<Void, Never>?
+    private var probingEngineID: Int64?
+    private var waitingForChannels = false
+    private var generatingRequest: (id: UUID, engineID: Int64)?
+    private var generationBlocked = false
+    private var generationError: String?
     private var failedUntil: [Int64: Date] = [:]
     private var channelErrors: [Int64: String] = [:]
     private var player: AVAudioPlayer?
@@ -81,7 +87,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     var onError: ((String?) -> Void)?
     var onFinish: (() -> Void)?
 
-    /// 缓存份数表示当前播放之外的后续份数，所有渠道共享同一个串行生成任务。
+    /// 缓存份数表示当前播放之外的后续份数，缓存串行生成，渠道恢复探测独立调度。
     init(service: HttpTTSService, channels: [HttpTTS], rate: Int, aheadCount: Int, retriesChannels: Bool, units: [ReaderHTTPSpeechUnit]) {
         self.service = service
         self.channels = channels
@@ -102,7 +108,9 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                 while true {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                     guard let self, !self.stopped else { return }
-                    if self.recoveryCandidate != nil { self.fillBuffer() }
+                    if self.recoveryProbe == nil, let (engine, unit) = self.recoveryCandidate {
+                        self.startRecovery(engine: engine, unit: unit)
+                    }
                 }
             } catch is CancellationError {
                 return
@@ -125,7 +133,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     func finishPlanning(error: String? = nil) {
         reachedEnd = true
         planningError = error
-        if let error { onError?(error) }
+        publishErrors()
         playIfReady()
     }
 
@@ -139,6 +147,9 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     /// 恢复使用同一个播放器和缓存队列，不重新提交已生成的正文。
     func resume() {
         isPaused = false
+        generationBlocked = false
+        generationError = nil
+        publishErrors()
         if let player {
             if !player.play() { playbackFailed(CocoaError(.fileReadCorruptFile)) }
         } else {
@@ -157,6 +168,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         worker?.cancel()
         worker = nil
         workerID = UUID()
+        waitingForChannels = false
         index = target
         let end = min(units.count, index + aheadCount + 1)
         let retained = Set(units[index..<end].map(\.id))
@@ -173,6 +185,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         stopped = true
         worker?.cancel()
         recoveryTimer?.cancel()
+        recoveryProbe?.cancel()
         player?.stop()
         player = nil
         prepared.removeAll()
@@ -184,20 +197,16 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 一个任务按正文顺序填充窗口，渠道恢复后重新准备尚未播放的低优先级缓存。
     private func fillBuffer() {
-        guard !stopped, worker == nil else { return }
+        guard !stopped, !generationBlocked, worker == nil else { return }
         let identity = UUID()
         workerID = identity
         worker = Task { [weak self] in
             guard let self else { return }
             defer { if self.workerID == identity { self.worker = nil } }
             do {
-                while !stopped {
+                while !stopped && !generationBlocked {
                     try Task.checkCancellation()
                     if needsMoreChapters { onNeedMore?() }
-                    if let (engine, unit) = recoveryCandidate {
-                        try await recover(engine: engine, unit: unit)
-                        continue
-                    }
                     let end = min(units.count, index + aheadCount + 1)
                     guard let target = (index..<end).first(where: { needsPreparation(at: $0) }) else { break }
                     let unit = units[target]
@@ -206,8 +215,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                     let value = try await synthesize(unit)
                     try Task.checkCancellation()
                     if target > index || (target == index && player == nil) {
-                        if let previous = prepared[unit.id] { removeFile(previous.fileURL) }
-                        prepared[unit.id] = value
+                        store(value, for: unit)
                     } else {
                         removeFile(value.fileURL)
                     }
@@ -218,7 +226,9 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             } catch is CancellationError {
                 return
             } catch {
-                onError?(error.localizedDescription)
+                generationBlocked = true
+                generationError = error.localizedDescription
+                publishErrors()
                 generationStatus = "音频生成失败：\(error.localizedDescription)"
                 publishStatus()
             }
@@ -235,13 +245,14 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 从高优先级渠道合成；失败保留同一份正文，全部失败则等到明确的重试时间。
     private func synthesize(_ unit: ReaderHTTPSpeechUnit) async throws -> Prepared {
-        if !retriesChannels { return try await prepare(engine: channels[0], unit: unit, reload: false) }
+        if !retriesChannels { return try await generate(engine: channels[0], unit: unit, reload: false) }
         while true {
             try Task.checkCancellation()
             for engine in channels {
+                if probingEngineID == engine.id { continue }
                 if let date = failedUntil[engine.id], date > Date() { continue }
                 do {
-                    let value = try await prepare(engine: engine, unit: unit, reload: failedUntil[engine.id] != nil)
+                    let value = try await generate(engine: engine, unit: unit, reload: failedUntil[engine.id] != nil)
                     markHealthy(engine)
                     return value
                 } catch let error as CacheWriteError {
@@ -251,11 +262,32 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                     recordFailure(engine, error: error)
                 }
             }
-            let retry = failedUntil.values.min()!
+            let retry = channels.filter { $0.id != probingEngineID }.compactMap { failedUntil[$0.id] }.min()!
             generationStatus = "全部渠道暂不可用，\(Int(ceil(max(retry.timeIntervalSinceNow, 0)))) 秒后重试当前缓存"
             publishStatus()
+            waitingForChannels = true
             try await Task.sleep(nanoseconds: UInt64(max(retry.timeIntervalSinceNow, 0) * 1_000_000_000))
+            waitingForChannels = false
         }
+    }
+
+    /// 用请求标识记录串行生成占用的渠道，恢复探测不能重复请求正在生成的同一渠道。
+    private func generate(engine: HttpTTS, unit: ReaderHTTPSpeechUnit, reload: Bool) async throws -> Prepared {
+        let identity = UUID()
+        generatingRequest = (identity, engine.id)
+        defer { if generatingRequest?.id == identity { generatingRequest = nil } }
+        return try await prepare(engine: engine, unit: unit, reload: reload)
+    }
+
+    /// 同一份正文同时完成恢复探测和备用合成时，保留优先级更高的已验证音频。
+    private func store(_ value: Prepared, for unit: ReaderHTTPSpeechUnit) {
+        if let previous = prepared[unit.id] {
+            let oldRank = channels.firstIndex(where: { $0.id == previous.engine.id })!
+            let newRank = channels.firstIndex(where: { $0.id == value.engine.id })!
+            if oldRank < newRank { removeFile(value.fileURL); return }
+            removeFile(previous.fileURL)
+        }
+        prepared[unit.id] = value
     }
 
     /// 完整音频验证后存入本次会话的磁盘缓存，多份整章音频不同时驻留在播放器内存中。
@@ -276,24 +308,60 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         }
     }
 
-    /// 缓存已满且正在使用备用渠道时，使用真实下一份正文恢复高优先级渠道。
+    /// 播放备用渠道时，选择到期且未被生成任务占用的高优先级渠道进行恢复探测。
     private var recoveryCandidate: (HttpTTS, ReaderHTTPSpeechUnit)? {
-        guard !isPaused, player != nil, units.indices.contains(index + 1),
+        guard !generationBlocked, !isPaused, player != nil, units.indices.contains(index + 1),
               let activeEngine, let activeIndex = channels.firstIndex(where: { $0.id == activeEngine.id }) else { return nil }
         for engine in channels.prefix(activeIndex) {
+            if engine.id == generatingRequest?.engineID { continue }
             if let date = failedUntil[engine.id], date <= Date() { return (engine, units[index + 1]) }
         }
         return nil
     }
 
-    /// 恢复成功只替换未播放的下一份缓存，当前音频持续播放到结束。
+    /// 恢复探测独立于串行缓存生成，失效渠道等待响应时不会阻塞备用渠道补足缓存。
+    private func startRecovery(engine: HttpTTS, unit: ReaderHTTPSpeechUnit) {
+        probingEngineID = engine.id
+        recoveryProbe = Task { [weak self] in
+            guard let self else { return }
+            defer { self.probingEngineID = nil; self.recoveryProbe = nil }
+            do {
+                try await recover(engine: engine, unit: unit)
+            } catch is CancellationError {
+                return
+            } catch {
+                generationBlocked = true
+                generationError = error.localizedDescription
+                generationStatus = "音频生成失败：\(error.localizedDescription)"
+                publishErrors()
+                publishStatus()
+                return
+            }
+            if waitingForChannels {
+                worker?.cancel()
+                worker = nil
+                workerID = UUID()
+                waitingForChannels = false
+            }
+            playIfReady()
+            fillBuffer()
+        }
+    }
+
+    /// 恢复成功只替换未播放的缓存，若该份已成为等待中的当前音频则立即交给播放器。
     private func recover(engine: HttpTTS, unit: ReaderHTTPSpeechUnit) async throws {
         do {
             let value = try await prepare(engine: engine, unit: unit, reload: true)
             markHealthy(engine)
-            if units.dropFirst(index + 1).contains(where: { $0.id == unit.id }) {
-                if let previous = prepared[unit.id] { removeFile(previous.fileURL) }
-                prepared[unit.id] = value
+            let target = units.firstIndex(where: { $0.id == unit.id })!
+            if target > index || (target == index && player == nil) {
+                store(value, for: unit)
+                if target == index {
+                    worker?.cancel()
+                    worker = nil
+                    workerID = UUID()
+                    waitingForChannels = false
+                }
             } else {
                 removeFile(value.fileURL)
             }
@@ -309,15 +377,21 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private func recordFailure(_ engine: HttpTTS, error: Error) {
         failedUntil[engine.id] = Date().addingTimeInterval(60)
         channelErrors[engine.id] = "\(engine.name)：\(error.localizedDescription)"
-        onError?(channels.compactMap { channelErrors[$0.id] }.joined(separator: "\n"))
+        publishErrors()
     }
 
     /// 成功解码后清除该渠道的失败状态，其余渠道错误继续保留。
     private func markHealthy(_ engine: HttpTTS) {
         failedUntil[engine.id] = nil
         channelErrors[engine.id] = nil
-        let messages = channels.compactMap { channelErrors[$0.id] }
-        onError?(messages.isEmpty ? planningError : messages.joined(separator: "\n"))
+        publishErrors()
+    }
+
+    /// 正文、缓存和渠道错误分别保留，其他渠道成功不能抹掉本地缓存写入失败。
+    private func publishErrors() {
+        let messages = [planningError, generationError].compactMap { $0 }
+            + channels.compactMap { channelErrors[$0.id] }
+        onError?(messages.isEmpty ? nil : messages.joined(separator: "\n"))
     }
 
     /// 只有真正开始播放才发布正文位置，等待生成时不提前跳页或清除当前文字。
@@ -346,6 +420,11 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     /// 播放失败从同一份正文重新选择渠道，不触发下一段或下一章的进度。
     private func playbackFailed(_ error: Error) {
         recordFailure(activeEngine!, error: error)
+        if !retriesChannels {
+            generationBlocked = true
+            generationError = error.localizedDescription
+            publishErrors()
+        }
         player?.stop()
         player = nil
         if let value = prepared[units[index].id] { removeFile(value.fileURL) }
@@ -378,7 +457,8 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         let ready = units.dropFirst(index + 1).filter { prepared[$0.id] != nil }.count
         let state = isPaused ? "已暂停" : (player != nil ? "播放中" : "等待音频")
         let channel = activeEngine.map { " · \($0.name)" } ?? ""
-        let loading = generationStatus.isEmpty ? "" : " · \(generationStatus)"
+        let detail = generationError.map { "音频生成失败：\($0)" } ?? generationStatus
+        let loading = detail.isEmpty ? "" : " · \(detail)"
         onStatus?("\(state)\(channel) · 已缓存 \(ready)/\(aheadCount) 份\(loading)", !isPaused && player == nil)
     }
 }
