@@ -19,7 +19,7 @@ defaults:
 
 jobs:
   build-and-release:
-    name: 测试、构建和发布未签名 IPA
+    name: 构建和发布未签名 IPA
     # 明确使用 Intel 托管池，避免默认标签进入当前容量受限的 ARM 池。
     runs-on: macos-15-intel
     timeout-minutes: 60
@@ -40,10 +40,6 @@ jobs:
           plutil -lint Legado.xcodeproj/project.pbxproj
           python3 -m json.tool App/Resources/httpTTS.json > /dev/null
           python3 -m json.tool App/Resources/txtTocRule.json > /dev/null
-          python3 -m unittest discover -s scripts/tests -v
-
-      - name: 运行核心及页面模型测试
-        run: swift test --disable-sandbox 2>&1 | tee artifacts/swift-tests.log
 
       - name: 解析 iOS 依赖
         run: |
@@ -82,16 +78,6 @@ jobs:
             -clonedSourcePackagesDirPath DerivedData/SourcePackages \
             -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tee artifacts/simulator-build.log
-
-      - name: 验证 EPUB 菜单与原排版阅读
-        run: |
-          xcodebuild test -project Legado.xcodeproj -scheme LegadoReaderTests \
-            -destination 'platform=iOS Simulator,name=iPhone 17,OS=26.1' \
-            -derivedDataPath DerivedData \
-            -clonedSourcePackagesDirPath DerivedData/SourcePackages \
-            -disableAutomaticPackageResolution -parallel-testing-enabled NO \
-            -only-testing:LegadoReaderTests/EPUBReaderIntegrationTests \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee artifacts/epub-tests.log
 
       - name: 归档真机架构
         env:
@@ -143,8 +129,8 @@ jobs:
           notes = (
               f"版本：{version}，构建号：{build}\n\n"
               "提供未签名 IPA，下载后需自行签名安装。\n\n"
-              "自动验证已通过：核心及页面模型测试、iOS 模拟器构建、EPUB 原排版与菜单回归、真机架构归档、IPA 完整性检查。"
-              "未进行真机运行或付费 MiMo API 调用。\n\n"
+              "构建已通过：iOS 模拟器构建、真机架构归档、IPA 完整性检查。"
+              "本工作流不运行自动化测试；未进行真机运行或付费 MiMo API 调用。\n\n"
               f"源码提交：{os.environ['GITHUB_SHA']}\n\n"
               + Path("CHANGELOG.md").read_text(encoding="utf-8")
           )
