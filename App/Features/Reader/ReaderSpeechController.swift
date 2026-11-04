@@ -226,6 +226,8 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             } catch is CancellationError {
                 return
             } catch {
+                // 跳段或停止后，旧请求返回的取消错误不能阻止后来启动的生成任务。
+                guard !Task.isCancelled, workerID == identity, !stopped else { return }
                 generationBlocked = true
                 generationError = error.localizedDescription
                 publishErrors()
