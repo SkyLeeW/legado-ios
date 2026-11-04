@@ -20,8 +20,8 @@ defaults:
 jobs:
   build-and-release:
     name: 构建和发布未签名 IPA
-    # 明确使用 Intel 托管池，避免默认标签进入当前容量受限的 ARM 池。
-    runs-on: macos-15-intel
+    # 使用官方 macOS 15 ARM 托管机，镜像提供下方指定的 Xcode 版本。
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       # 固定项目所需的 Xcode 版本，工具缺失时直接失败。
