@@ -52,6 +52,12 @@ public struct HttpTTSAudioStream: Sendable {
     }
 }
 
+/// 正常听书复用音频缓存，配置试听则强制请求以验证当前密钥。
+public enum HttpTTSCachePolicy: Sendable {
+    case useCache
+    case reload
+}
+
 public actor HttpTTSAudioCache {
     public static let shared = HttpTTSAudioCache()
     private let directory: URL
@@ -106,26 +112,37 @@ public actor HttpTTSService {
     private let networkPolicy: SourceNetworkPolicy
     private let transport: any HTTPTransport
     private let cache: HttpTTSAudioCache
+    private let miMoService: MiMoTTSService
 
+    /// 注入网络、缓存和密钥读取方式，使渠道请求可独立验证。
     public init(
         urlBuilder: LegadoURLBuilder = .init(),
         networkPolicy: SourceNetworkPolicy = .shared,
         transport: any HTTPTransport = URLSessionHTTPTransport(),
-        cache: HttpTTSAudioCache = .shared
+        cache: HttpTTSAudioCache = .shared,
+        miMoAPIKey: @escaping @Sendable (Int64) throws -> String? = { try MiMoTTSKeychain.load(engineID: $0) }
     ) {
         self.urlBuilder = urlBuilder
         self.networkPolicy = networkPolicy
         self.transport = transport
         self.cache = cache
+        self.miMoService = MiMoTTSService(transport: transport, apiKey: miMoAPIKey)
     }
 
-    public func audio(engine: HttpTTS, text: String, speechRate: Int) async throws -> HttpTTSAudio {
+    /// 按配置渠道合成可播放音频，试听时跳过已有缓存以验证实际请求。
+    public func audio(engine: HttpTTS, text: String, speechRate: Int, cachePolicy: HttpTTSCachePolicy = .useCache) async throws -> HttpTTSAudio {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw HttpTTSServiceError.emptyText }
         let source = engine.bookSourceAdapter
         let cacheKey = try Self.cacheKey(engine: engine, text: text, speechRate: speechRate)
-        if let data = await cache.data(for: cacheKey) {
+        if case .useCache = cachePolicy, let data = await cache.data(for: cacheKey) {
             return .init(data: data, contentType: engine.contentType, finalURL: cacheURL(engine: engine))
+        }
+        // MiMo 返回 JSON 包装的音频，由渠道协议解析后再缓存实际 WAV 数据。
+        if let configuration = engine.mimo {
+            let audio = try await miMoService.audio(engineID: engine.id, configuration: configuration, text: text)
+            await cache.store(audio.data, for: cacheKey)
+            return audio
         }
         let context = URLTemplateContext(
             key: text,
@@ -201,11 +218,17 @@ public actor HttpTTSService {
         throw lastError
     }
 
-    public func audioStream(engine: HttpTTS, text: String, speechRate: Int) async throws -> HttpTTSAudioStream {
+    /// 返回渠道定义的音频传输方式，MiMo 使用完整 WAV，其余 HTTP 渠道保留流式协议。
+    public func audioStream(engine: HttpTTS, text: String, speechRate: Int, cachePolicy: HttpTTSCachePolicy = .useCache) async throws -> HttpTTSAudioStream {
+        // MiMo 渠道明确采用官方非流式 WAV 接口，通用流式开关不改变渠道协议。
+        if engine.mimo != nil {
+            let value = try await audio(engine: engine, text: text, speechRate: speechRate, cachePolicy: cachePolicy)
+            return Self.bufferedStream(data: value.data, contentType: value.contentType, finalURL: value.finalURL)
+        }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw HttpTTSServiceError.emptyText }
         let cacheKey = try Self.cacheKey(engine: engine, text: text, speechRate: speechRate)
-        if let data = await cache.data(for: cacheKey) {
+        if case .useCache = cachePolicy, let data = await cache.data(for: cacheKey) {
             return Self.bufferedStream(
                 data: data,
                 contentType: engine.contentType,
@@ -215,7 +238,7 @@ public actor HttpTTSService {
         let requiresBufferedValidation = engine.loginCheckJs?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         guard !requiresBufferedValidation,
               let streamingTransport = transport as? any StreamingHTTPTransport else {
-            let value = try await audio(engine: engine, text: text, speechRate: speechRate)
+            let value = try await audio(engine: engine, text: text, speechRate: speechRate, cachePolicy: cachePolicy)
             return Self.bufferedStream(data: value.data, contentType: value.contentType, finalURL: value.finalURL)
         }
         let source = engine.bookSourceAdapter
@@ -230,7 +253,7 @@ public actor HttpTTSService {
             defaultHeaders: try BookSourceHeaderResolver().resolve(source)
         )
         if prepared.bodyJavaScript != nil || prepared.responseType != nil || prepared.proxy != nil || prepared.useWebView {
-            let value = try await audio(engine: engine, text: text, speechRate: speechRate)
+            let value = try await audio(engine: engine, text: text, speechRate: speechRate, cachePolicy: cachePolicy)
             return Self.bufferedStream(data: value.data, contentType: value.contentType, finalURL: value.finalURL)
         }
         let response = try await networkPolicy.executeStream(
@@ -272,17 +295,29 @@ public actor HttpTTSService {
         )
     }
 
+    /// 只使用影响实际合成的配置生成缓存标识，避免重复付费合成相同内容。
     private static func cacheKey(engine: HttpTTS, text: String, speechRate: Int) throws -> String {
+        // MiMo 只按实际合成参数区分缓存，保存时间和通用语速不会改变合成内容。
+        struct MiMoCacheInput: Encodable {
+            let engineID: Int64
+            let configuration: MiMoTTSConfiguration
+            let model = MiMoTTSConfiguration.model
+            let text: String
+        }
         struct CacheInput: Encodable {
             let engine: HttpTTS
             let text: String
             let speechRate: Int
         }
-        // Voices can share an endpoint and select their speaker through headers
-        // or JavaScript. Include the complete configuration and source identity.
+        // 通用 HTTP 引擎可能通过 Header 或脚本选择音色，因此保留完整配置参与缓存。
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        let data = try encoder.encode(CacheInput(engine: engine, text: text, speechRate: speechRate))
+        let data: Data
+        if let configuration = engine.mimo {
+            data = try encoder.encode(MiMoCacheInput(engineID: engine.id, configuration: configuration, text: text))
+        } else {
+            data = try encoder.encode(CacheInput(engine: engine, text: text, speechRate: speechRate))
+        }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 

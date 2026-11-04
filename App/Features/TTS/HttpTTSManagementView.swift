@@ -29,10 +29,30 @@ final class HttpTTSLibraryModel: ObservableObject {
         await persist(values)
     }
 
+    /// MiMo 密钥写入 Keychain，渠道配置保存成功后再更新列表。
+    func saveMiMo(_ value: HttpTTS, apiKey: String) async throws {
+        var value = value
+        value.lastUpdateTime = Int64(Date().timeIntervalSince1970 * 1_000)
+        try MiMoTTSKeychain.save(apiKey, engineID: value.id)
+        let values = sorted(engines.filter { $0.id != value.id } + [value])
+        try await repository().saveHttpTTS(values)
+        engines = values
+    }
+
+    /// 删除配置成功后清理对应的 MiMo 密钥，失败时保留错误信息。
     func delete(at offsets: IndexSet) async {
+        let removed = offsets.map { engines[$0] }
         var values = engines
         values.remove(atOffsets: offsets)
-        await persist(values)
+        do {
+            try await repository().saveHttpTTS(values)
+            engines = values
+            for engine in removed where engine.mimo != nil {
+                try MiMoTTSKeychain.delete(engineID: engine.id)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func importData(_ data: Data) async {
@@ -120,7 +140,10 @@ struct HttpTTSManagementView: View {
         .navigationTitle("在线朗读引擎")
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("新建", systemImage: "plus") { editing = HttpTTS() }
+                Menu("新建", systemImage: "plus") {
+                    Button("小米 MiMo 渠道") { editing = .miMoEngine() }
+                    Button("自定义 HTTP 引擎") { editing = HttpTTS() }
+                }
                 Menu("更多", systemImage: "ellipsis.circle") {
                     Button("导入", systemImage: "square.and.arrow.down") { importsFile = true }
                     Button("导出", systemImage: "square.and.arrow.up") {
@@ -141,8 +164,14 @@ struct HttpTTSManagementView: View {
         .task { await model.load() }
         .sheet(item: $editing) { engine in
             ReadingNavigationStack {
-                HttpTTSEditorView(engine: engine) { value in
-                    Task { await model.save(value) }
+                if let configuration = engine.mimo {
+                    MiMoTTSEditorView(engine: engine, configuration: configuration) { value, apiKey in
+                        try await model.saveMiMo(value, apiKey: apiKey)
+                    }
+                } else {
+                    HttpTTSEditorView(engine: engine) { value in
+                        Task { await model.save(value) }
+                    }
                 }
             }
         }
@@ -170,6 +199,99 @@ struct HttpTTSManagementView: View {
             Button("确定", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+    }
+}
+
+/// MiMo 渠道只开放密钥和音色，保存后可在现有听书引擎列表中使用。
+@MainActor
+private struct MiMoTTSEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    private let engine: HttpTTS
+    private let onSave: @MainActor (HttpTTS, String) async throws -> Void
+    @State private var apiKey = ""
+    @State private var voice: MiMoTTSVoice
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+    @StateObject private var speech = ReaderSpeechController()
+
+    /// 使用已保存的音色初始化表单，密钥在打开页面时从 Keychain 读取。
+    init(engine: HttpTTS, configuration: MiMoTTSConfiguration, onSave: @escaping @MainActor (HttpTTS, String) async throws -> Void) {
+        self.engine = engine
+        self.onSave = onSave
+        _voice = State(initialValue: configuration.voice)
+    }
+
+    var body: some View {
+        Form {
+            Section("小米 MiMo 渠道") {
+                SecureField("API Key", text: $apiKey)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+                Picker("音色", selection: $voice) {
+                    ForEach(MiMoTTSVoice.allCases, id: \.self) { voice in
+                        Text(voice.displayName).tag(voice)
+                    }
+                }
+            }
+            .disabled(isSaving)
+            Section {
+                if speech.isSpeaking || speech.isPaused {
+                    Button("停止试听", systemImage: "stop.fill") { speech.stop() }
+                } else {
+                    Button("保存并试听", systemImage: "play.fill") {
+                        Task { await save(closesEditor: false) }
+                    }
+                    .disabled(apiKey.isEmpty || isSaving)
+                }
+                if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                if let error = speech.errorMessage { Text(error).foregroundStyle(.red) }
+            } footer: {
+                Text("密钥仅保存在本机，导出的配置不包含密钥。")
+            }
+        }
+        .navigationTitle("小米 MiMo")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("关闭") { dismiss() }.disabled(isSaving)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button(isSaving ? "保存中…" : "保存") {
+                    Task { await save(closesEditor: true) }
+                }
+                .disabled(apiKey.isEmpty || isSaving)
+            }
+        }
+        .task {
+            do { apiKey = try MiMoTTSKeychain.load(engineID: engine.id) ?? "" }
+            catch { errorMessage = error.localizedDescription }
+        }
+        .onChange(of: apiKey) { _ in speech.stop() }
+        .onChange(of: voice) { _ in speech.stop() }
+        .onDisappear { speech.stop() }
+        .interactiveDismissDisabled(isSaving)
+    }
+
+    /// 保存密钥和音色后关闭页面或朗读固定示例，失败时保留表单并展示原因。
+    @MainActor
+    private func save(closesEditor: Bool) async {
+        isSaving = true
+        errorMessage = nil
+        speech.stop()
+        defer { isSaving = false }
+        var value = engine
+        value.mimo = MiMoTTSConfiguration(voice: voice)
+        do {
+            try await onSave(value, apiKey)
+            if closesEditor {
+                dismiss()
+            } else {
+                speech.configure(followsSystemRate: false, speechRate: 5, readByPage: true, streamsHTTPAudio: false)
+                speech.speakHTTP(engine: value, text: "你好，这是小米 MiMo 的听书声音。愿每一个故事，都能陪你度过美好的时光。", cachePolicy: .reload)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 }

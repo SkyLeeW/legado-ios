@@ -26,6 +26,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("JavaScriptCore"),
                 .linkedFramework("CryptoKit"),
+                .linkedFramework("Security"),
                 .linkedLibrary("sqlite3")
             ]
         ),

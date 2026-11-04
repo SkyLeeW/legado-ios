@@ -76,6 +76,8 @@ public struct TxtTocRule: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct HttpTTS: Codable, Hashable, Identifiable, Sendable {
+    /// MiMo 渠道使用独立的音色配置，密钥仅保存在设备 Keychain 中。
+    public var mimo: MiMoTTSConfiguration?
     public var id: Int64
     public var name: String
     public var url: String
@@ -94,8 +96,10 @@ public struct HttpTTS: Codable, Hashable, Identifiable, Sendable {
         loginCheckJs = nil; lastUpdateTime = id
     }
 
+    /// 解码 HTTP 参数及可选的 MiMo 音色配置，密钥不参与配置导入。
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        mimo = try values.decodeIfPresent(MiMoTTSConfiguration.self, forKey: .mimo)
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         id = (try? values.decode(Int64.self, forKey: .id))
             ?? Int64((try? values.decode(String.self, forKey: .id)) ?? "")

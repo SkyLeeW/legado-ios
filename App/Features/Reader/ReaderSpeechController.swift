@@ -122,6 +122,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     private var httpSegments: [String] = []
     private var httpSegmentIndex = 0
     private var httpEngine: HttpTTS?
+    private var httpCachePolicy: HttpTTSCachePolicy = .useCache
     private var systemSegments: [String] = []
     private var systemSegmentIndex = 0
     private var segmentIndexOffset = 0
@@ -244,17 +245,20 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         playCurrentSystemSegment()
     }
 
+    /// 开始所选渠道的分段朗读，配置试听可指定重新请求以验证密钥。
     func speakHTTP(
         engine: HttpTTS,
         text: String,
         continuesAcrossChapters: Bool = false,
-        segmentIndexOffset: Int = 0
+        segmentIndexOffset: Int = 0,
+        cachePolicy: HttpTTSCachePolicy = .useCache
     ) {
         stop()
         errorMessage = nil
         activateAudioSession()
         self.continuesAcrossChapters = continuesAcrossChapters
         httpEngine = engine
+        httpCachePolicy = cachePolicy
         httpSegments = segments(for: text)
         guard !httpSegments.isEmpty else { return }
         httpSegmentIndex = 0
@@ -530,7 +534,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
             guard let self else { return }
             do {
                 if streamsHTTPAudio {
-                    let stream = try await httpService.audioStream(engine: engine, text: text, speechRate: rate)
+                    let stream = try await httpService.audioStream(engine: engine, text: text, speechRate: rate, cachePolicy: httpCachePolicy)
                     try Task.checkCancellation()
                     if stream.isIncremental, stream.expectedContentLength ?? 0 > 0 {
                         playIncrementalHTTPStream(stream)
@@ -541,7 +545,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
                         try playBufferedHTTPAudio(data)
                     }
                 } else {
-                    let audio = try await httpService.audio(engine: engine, text: text, speechRate: rate)
+                    let audio = try await httpService.audio(engine: engine, text: text, speechRate: rate, cachePolicy: httpCachePolicy)
                     try Task.checkCancellation()
                     try playBufferedHTTPAudio(audio.data)
                 }
@@ -592,7 +596,10 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         else { finishNaturally() }
     }
 
+    /// 仅对允许预读的渠道请求后续段落，MiMo 始终按播放需求合成。
     private func prefetchHTTP(engine: HttpTTS, texts: [String]) {
+        // MiMo 按实际播放段落合成，不对未收听内容发起计费请求。
+        if engine.mimo != nil { return }
         guard !texts.isEmpty else { return }
         let rate = speechRate + 5
         let task = Task { [weak self] in
