@@ -419,34 +419,17 @@ final class ReaderViewModel: ObservableObject {
         }
     }
 
-    func nextSpeechContent(rules: [ReplaceRule]) async -> String? {
-        guard let chapter = nextReadableChapter(after: currentIndex) else { return nil }
-        let report: ChapterContentReport
-        if let source {
-            report = await contentCoordinator.load(
-                book: book,
-                chapter: chapter,
-                source: source,
-                nextChapterURL: nextReadableChapter(after: chapter.index)?.url
-            ).report
-        } else {
-            do {
-                report = try await Task.detached { [localService, book, chapter] in
-                    try localService.loadContent(book: book, chapter: chapter)
-                }.value
-            } catch {
-                return nil
-            }
+    /// 按真实章节顺序读取听书缓存正文，加载错误正常抛出，只有到达书尾才返回空值。
+    func speechChapter(after index: Int, rules: [ReplaceRule]) async throws -> ReaderScrollChapter? {
+        guard let nextIndex = chapters.indices.dropFirst(index + 1).first(where: { !chapters[$0].isVolume }) else { return nil }
+        let chapter = chapters[nextIndex]
+        let result = await loadAdjacentChapter(chapter, rules: rules)
+        try Task.checkCancellation()
+        if let error = result.error {
+            throw NSError(domain: "Legado.SpeechChapter", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "\(chapter.title)：\(error)"])
         }
-        var effectiveChapter = chapter
-        if let resolvedTitle = report.title { effectiveChapter.title = resolvedTitle }
-        let value = sanitizer.process(
-            book: book,
-            chapter: effectiveChapter,
-            content: report.content,
-            rules: usesReplaceRules ? rules : []
-        ).content
-        return value.isEmpty ? nil : value
+        return .init(id: nextIndex, title: result.title, content: result.content)
     }
 
     @discardableResult

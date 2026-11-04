@@ -57,6 +57,11 @@ struct ReaderView: View {
     @State private var progressSaveTask: Task<Void, Never>?
     @State private var progressSaveGeneration = 0
     @State private var speechStartGeneration = 0
+    @State private var speechPrefetchTask: Task<Void, Never>?
+    @State private var speechPrefetchSession: UUID?
+    @State private var speechLastPlannedChapter = 0
+    @State private var activeSpeechCacheUnit = "characters"
+    @State private var activeSpeechCacheCharacters = 1000
     @State private var speechTimerRemaining = 0
     @State private var isSavingBookmark = false
     @ScaledMetric(relativeTo: .body) private var toolbarIconSize = 21
@@ -102,6 +107,10 @@ struct ReaderView: View {
     @AppStorage("appTtsEngine") private var appTTSEngine = ""
     @AppStorage("systemTtsVoice") private var systemTTSVoice = ""
     @AppStorage("readAloudByPage") private var readAloudByPage = false
+    @AppStorage("ttsCacheUnit") private var ttsCacheUnit = "characters"
+    @AppStorage("ttsCacheCharacters") private var ttsCacheCharacters = 1000
+    @AppStorage("ttsCacheAheadCount") private var ttsCacheAheadCount = 3
+    @AppStorage("ttsFollowAudio") private var ttsFollowAudio = false
     @AppStorage("streamReadAloudAudio") private var streamReadAloudAudio = true
     @AppStorage("readAloudWakeLock") private var readAloudWakeLock = false
     @AppStorage("ignoreAudioFocus") private var ignoreAudioFocus = false
@@ -216,6 +225,7 @@ struct ReaderView: View {
             activity.beginReading(book)
             speech.onNextChapter = { moveSpeechToChapter(direction: 1) }
             speech.onPreviousChapter = { moveSpeechToChapter(direction: -1) }
+            speech.onNeedHTTPChapters = { loadMoreHTTPSpeechChapters() }
             speech.onRemoteStop = {
                 speechTimerTask?.cancel()
                 speechTimerRemaining = 0
@@ -244,6 +254,7 @@ struct ReaderView: View {
             }
         }
         .onDisappear {
+            speechPrefetchTask?.cancel()
             isAutoReading = false
             UIApplication.shared.isIdleTimerDisabled = false
             if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
@@ -259,6 +270,7 @@ struct ReaderView: View {
             speech.onNextChapter = nil
             speech.onPreviousChapter = nil
             speech.onRemoteStop = nil
+            speech.onNeedHTTPChapters = nil
         }
         .overlay(alignment: .bottom) {
             if showsReaderMenu {
@@ -360,12 +372,15 @@ struct ReaderView: View {
             }
         }
         .onChange(of: speech.currentSegmentIndex) { index in
-            guard model.paragraphs.indices.contains(index), !readAloudByPage else { return }
+            guard !speech.isUsingHTTPQueue, model.paragraphs.indices.contains(index), !readAloudByPage else { return }
             readerJumpPosition = nil
             DispatchQueue.main.async { readerJumpPosition = model.paragraphs[index].id }
         }
+        .onChange(of: speech.currentHTTPUnit) { unit in
+            if let unit { followHTTPAudio(unit) }
+        }
         .onChange(of: readAloudByPage) { _ in
-            restartSpeechAfterReaderLayoutChange()
+            if selectedHTTPEngine == nil { restartSpeechAfterReaderLayoutChange() }
         }
         .onChange(of: readAloudWakeLock) { _ in
             updateIdleTimer()
@@ -887,6 +902,12 @@ struct ReaderView: View {
     private var readerBottomChrome: some View {
         VStack(spacing: 12) {
             readerChapterControls
+            if speech.isUsingHTTPQueue {
+                HStack(spacing: 8) {
+                    if speech.isBuffering { ProgressView() }
+                    Text(speech.channelStatus).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
             Rectangle().fill(Color(uiColor: .separator).opacity(0.35)).frame(height: 0.5)
             LazyVGrid(columns: readerToolbarColumns, spacing: 12) {
                 readerChromeAction("list.bullet", "目录") {
@@ -1566,7 +1587,9 @@ struct ReaderView: View {
         case 13:
             isAutoReading = false
             configureSpeech()
-            if let engine = selectedHTTPEngine {
+            if !speech.isSpeaking && !speech.isPaused {
+                toggleSpeech()
+            } else if let engine = selectedHTTPEngine {
                 speech.pauseOrResumeHTTP(engine: engine, text: model.content, continuesAcrossChapters: true)
             } else {
                 speech.pauseOrResume(text: model.content, continuesAcrossChapters: true)
@@ -1647,8 +1670,7 @@ struct ReaderView: View {
                     Toggle("跟随系统语速", isOn: $ttsFollowSystem)
                     Stepper("朗读语速：\(ttsSpeechRate)", value: $ttsSpeechRate, in: 0...45)
                         .disabled(ttsFollowSystem)
-                    Toggle("按页朗读", isOn: $readAloudByPage)
-                    Toggle("流式播放在线音频", isOn: $streamReadAloudAudio)
+                    if selectedHTTPEngine == nil { Toggle("按页朗读", isOn: $readAloudByPage) }
                     Toggle("朗读时保持亮屏", isOn: $readAloudWakeLock)
                     Toggle("忽略音频焦点", isOn: $ignoreAudioFocus)
                     Toggle("忽略焦点时仍在来电时暂停", isOn: $pauseReadAloudWhilePhoneCalls)
@@ -1663,6 +1685,25 @@ struct ReaderView: View {
                     if !speech.channelStatus.isEmpty { Text(speech.channelStatus).font(.footnote) }
                     if let error = speech.errorMessage {
                         Text(error).font(.footnote).foregroundStyle(.red)
+                    }
+                }
+
+                if selectedHTTPEngine != nil {
+                    Section {
+                        Picker("每份缓存", selection: $ttsCacheUnit) {
+                            Text("按字数").tag("characters")
+                            Text("半章").tag("halfChapter")
+                            Text("整章").tag("chapter")
+                        }
+                        if ttsCacheUnit == "characters" {
+                            Stepper("每份 \(ttsCacheCharacters) 字", value: $ttsCacheCharacters, in: 100...5000, step: 100)
+                        }
+                        Stepper("提前缓存 \(ttsCacheAheadCount) 份", value: $ttsCacheAheadCount, in: 1...8)
+                        Toggle("跟随音频翻页", isOn: $ttsFollowAudio)
+                    } header: {
+                        Text("在线听书缓存")
+                    } footer: {
+                        Text("播放时在后台补足后续缓存，可跨章预生成。缓存单位和份数在下次开始听书时生效；预生成的正文可能产生费用。关闭跟随翻页时保留当前阅读画面。")
                     }
                 }
 
@@ -2016,6 +2057,20 @@ struct ReaderView: View {
     }
 
     private func startConfiguredSpeech() {
+        if let engine = selectedHTTPEngine {
+            // 在线播放计划基于完整章节，屏幕上的分页不再决定请求和播放器的生命周期。
+            speechPrefetchTask?.cancel()
+            speechPrefetchTask = nil
+            speechPrefetchSession = nil
+            speechLastPlannedChapter = model.currentIndex
+            activeSpeechCacheUnit = ttsCacheUnit
+            activeSpeechCacheCharacters = ttsCacheCharacters
+            resumesSpeechAfterChapterLoad = false
+            speech.speakHTTPContinuously(engine: engine, units: makeHTTPUnits(
+                index: model.currentIndex, title: model.title, content: model.content, position: readerPosition
+            ), aheadCount: ttsCacheAheadCount)
+            return
+        }
         if readAloudByPage {
             guard !readerPageRanges.isEmpty else {
                 guard !model.content.isEmpty else { return }
@@ -2039,17 +2094,7 @@ struct ReaderView: View {
         let text = model.paragraphs.indices.contains(start)
             ? model.paragraphs[start...].map(\.text).joined(separator: "\n")
             : model.content
-        if let engine = selectedHTTPEngine {
-            speech.speakHTTP(
-                engine: engine,
-                text: text,
-                continuesAcrossChapters: true,
-                segmentIndexOffset: start
-            )
-            prefetchNextChapterSpeech(engine: engine)
-        } else {
-            speech.speak(text, continuesAcrossChapters: true, segmentIndexOffset: start)
-        }
+        speech.speak(text, continuesAcrossChapters: true, segmentIndexOffset: start)
     }
 
     private func speakPage(at index: Int, from position: Int? = nil) {
@@ -2065,21 +2110,7 @@ struct ReaderView: View {
             return
         }
         let pageText = (model.content as NSString).substring(with: pageRange)
-        if let engine = selectedHTTPEngine {
-            // 下一页必须使用排版后的真实范围，确保预生成文本与翻页后的播放请求一致。
-            let nextIndex = index + 1
-            let nextText = readerPageRanges.indices.contains(nextIndex)
-                ? (model.content as NSString).substring(with: readerPageRanges[nextIndex]) : nil
-            speech.speakHTTP(
-                engine: engine,
-                text: pageText,
-                continuesAcrossChapters: true,
-                segmentIndexOffset: 0,
-                nextText: nextText
-            )
-        } else {
-            speech.speak(pageText, continuesAcrossChapters: true, segmentIndexOffset: 0)
-        }
+        speech.speak(pageText, continuesAcrossChapters: true, segmentIndexOffset: 0)
     }
 
     private func continueSpeechToNextPage() {
@@ -2099,13 +2130,53 @@ struct ReaderView: View {
         speakPage(at: speechPageIndex)
     }
 
-    private func prefetchNextChapterSpeech(engine: HttpTTS) {
+    /// 缓存单位始终使用原章的字符位置，半章按整章长度划分而不按当前页估算。
+    private func makeHTTPUnits(index: Int, title: String, content: String, position: Int = 0) -> [ReaderHTTPSpeechUnit] {
+        ReaderHTTPSpeechUnit.make(chapterIndex: index, title: title, text: content, position: position,
+                                  mode: activeSpeechCacheUnit, characterCount: activeSpeechCacheCharacters)
+    }
+
+    /// 串行补充足够的章节正文，取消或换书后禁止旧任务向新会话追加内容。
+    private func loadMoreHTTPSpeechChapters() {
+        guard speechPrefetchTask == nil else { return }
         let session = speech.httpSessionID
-        Task {
-            guard let content = await model.nextSpeechContent(
-                rules: model.usesReplaceRules ? replaceRules.rules : []
-            ), selectedHTTPEngine?.id == engine.id, speech.httpSessionID == session else { return }
-            speech.prepareHTTPContinuation(text: content)
+        speechPrefetchSession = session
+        speechPrefetchTask = Task { @MainActor in
+            defer {
+                if speechPrefetchSession == session {
+                    speechPrefetchTask = nil
+                    speechPrefetchSession = nil
+                }
+            }
+            do {
+                while speech.needsMoreHTTPChapters {
+                    let chapter = try await model.speechChapter(after: speechLastPlannedChapter, rules: replaceRules.rules)
+                    try Task.checkCancellation()
+                    guard speech.httpSessionID == session else { return }
+                    guard let chapter else { speech.finishHTTPPlanning(); return }
+                    speechLastPlannedChapter = chapter.id
+                    speech.appendHTTPUnits(makeHTTPUnits(index: chapter.id, title: chapter.title, content: chapter.content))
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard speech.httpSessionID == session else { return }
+                speech.finishHTTPPlanning(error: error.localizedDescription)
+            }
+        }
+    }
+
+    /// 音频开始播放后才同步章节；仅在用户开启跟随且位置离开当前页时翻页。
+    private func followHTTPAudio(_ unit: ReaderHTTPSpeechUnit) {
+        if unit.chapterIndex != model.currentIndex {
+            saveProgress(immediate: true)
+            model.select(index: unit.chapterIndex, position: unit.position)
+            readerPosition = unit.position
+            readerJumpPosition = nil
+        } else if ttsFollowAudio {
+            let pageIndex = currentPage - 1
+            if readerPageRanges.indices.contains(pageIndex), NSLocationInRange(unit.position, readerPageRanges[pageIndex]) { return }
+            readerJumpPosition = unit.position
         }
     }
 

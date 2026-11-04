@@ -252,7 +252,7 @@ private struct HttpTTSFailoverSettingsView: View {
                 }
             }
             Section {
-                Text("播放期间会提前生成下一段或下一页，恢复探测也使用真实正文，付费渠道可能计费。完整音频合成沿用渠道服务的 300 秒请求超时；试听不切换渠道。")
+                Text("阅读设置中可选择按字数、半章或整章提前缓存多份音频，恢复探测使用真实下一份正文，付费渠道可能计费。完整音频合成沿用渠道服务的 300 秒请求超时；试听不切换渠道。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }
