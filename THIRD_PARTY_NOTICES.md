@@ -35,6 +35,13 @@
 - 随阅读组件分发的 OpenDyslexic、iA Writer Duospace、AccessibleDfA 字体保留原始资源，版权及许可说明一并收录在上述许可文件中。
 - iOS 依赖版本和来源由 Xcode 工程内的 `Package.resolved` 锁定；未使用 Readium LCP 或云端解密服务。
 
+
+## edge-tts
+
+- 项目：<https://github.com/rany2/edge-tts>。
+- 用途：Microsoft Edge 在线朗读渠道的 WebSocket 协议、Sec-MS-GEC v2 令牌与音色列表接口依据该项目实现。
+- 许可：LGPLv3。本仓库未纳入其 Python 源码，仅按协议自行实现对应逻辑。
+
 ## 测试数据与演示内容
 
 测试中的规则样本仅用于兼容验证，不打包为 App 默认书源。具体说明见 [测试样本说明](Tests/LegadoCoreTests/Fixtures/README.md)。演示模式使用虚构书籍元数据和项目内演示文本；发布截图不使用个人书架、登录信息或付费章节。

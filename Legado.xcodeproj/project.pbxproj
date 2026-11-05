@@ -102,6 +102,8 @@
 		C1000000000000000000002D /* AddBookURLService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2000000000000000000002D /* AddBookURLService.swift */; };
 		C1000000000000000000002E /* HttpTTSService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2000000000000000000002E /* HttpTTSService.swift */; };
 		E71000000000000000000001 /* MiMoTTS.swift 渠道实现 */ = {isa = PBXBuildFile; fileRef = E72000000000000000000001; };
+		E71000000000000000000002 /* EdgeTTS.swift in Sources */ = {isa = PBXBuildFile; fileRef = E72000000000000000000002; };
+		E71000000000000000000003 /* EdgeTTSGEC.swift in Sources */ = {isa = PBXBuildFile; fileRef = E72000000000000000000003; };
 		B10000000000000000000027 /* BookshelfReadViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000027 /* BookshelfReadViewModel.swift */; };
 		B10000000000000000000028 /* BookDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000028 /* BookDetailViewModel.swift */; };
 		910000000000000000000001 /* ApplicationSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20000000000000000000001 /* ApplicationSettings.swift */; };
@@ -234,6 +236,8 @@
 		C2000000000000000000002D /* AddBookURLService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddBookURLService.swift; sourceTree = "<group>"; };
 		C2000000000000000000002E /* HttpTTSService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HttpTTSService.swift; sourceTree = "<group>"; };
 		E72000000000000000000001 /* MiMoTTS.swift 渠道实现 */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiMoTTS.swift; sourceTree = "<group>"; };
+		E72000000000000000000002 /* EdgeTTS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeTTS.swift; sourceTree = "<group>"; };
+		E72000000000000000000003 /* EdgeTTSGEC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EdgeTTSGEC.swift; sourceTree = "<group>"; };
 		D20000000000000000000001 /* Legado.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Legado.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B20000000000000000000027 /* BookshelfReadViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BookshelfReadViewModel.swift; sourceTree = "<group>"; };
 		B20000000000000000000028 /* BookDetailViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BookDetailViewModel.swift; sourceTree = "<group>"; };
@@ -564,6 +568,8 @@
 			children = (
 				C2000000000000000000002E /* HttpTTSService.swift */,
 				E72000000000000000000001 /* MiMoTTS.swift 渠道实现 */,
+				E72000000000000000000002 /* EdgeTTS.swift */,
+				E72000000000000000000003 /* EdgeTTSGEC.swift */,
 			);
 			path = TTS;
 			sourceTree = "<group>";
@@ -836,6 +842,8 @@
 				C1000000000000000000002C /* RSSSourceDebugger.swift in Sources */,
 				C1000000000000000000002E /* HttpTTSService.swift in Sources */,
 				E71000000000000000000001 /* MiMoTTS.swift 渠道实现 */,
+				E71000000000000000000002 /* EdgeTTS.swift in Sources */,
+				E71000000000000000000003 /* EdgeTTSGEC.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -908,12 +916,12 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 29;
 				DEVELOPMENT_ASSET_PATHS = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.1.17;
+				MARKETING_VERSION = 0.1.18;
 				OTHER_LDFLAGS = "$(inherited) -lsqlite3";
 				PRODUCT_BUNDLE_IDENTIFIER = com.epiboly.legado;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -929,11 +937,11 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 28;
+				CURRENT_PROJECT_VERSION = 29;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.1.17;
+				MARKETING_VERSION = 0.1.18;
 				OTHER_LDFLAGS = "$(inherited) -lsqlite3";
 				PRODUCT_BUNDLE_IDENTIFIER = com.epiboly.legado;
 				PRODUCT_NAME = "$(TARGET_NAME)";

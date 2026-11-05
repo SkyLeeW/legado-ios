@@ -78,6 +78,8 @@ public struct TxtTocRule: Codable, Hashable, Identifiable, Sendable {
 public struct HttpTTS: Codable, Hashable, Identifiable, Sendable {
     /// MiMo 渠道使用独立的音色配置，密钥仅保存在设备 Keychain 中。
     public var mimo: MiMoTTSConfiguration?
+    /// Edge 渠道使用微软在线朗读接口，只保存音色短名。
+    public var edge: EdgeTTSConfiguration?
     public var id: Int64
     public var name: String
     public var url: String
@@ -94,12 +96,14 @@ public struct HttpTTS: Codable, Hashable, Identifiable, Sendable {
         self.id = id; self.name = name; self.url = url; contentType = nil; concurrentRate = "0"
         loginUrl = nil; loginUi = nil; header = nil; jsLib = nil; enabledCookieJar = false
         loginCheckJs = nil; lastUpdateTime = id
+        mimo = nil; edge = nil
     }
 
-    /// 解码 HTTP 参数及可选的 MiMo 音色配置，密钥不参与配置导入。
+    /// 解码 HTTP 参数及可选的 MiMo / Edge 音色配置，密钥不参与配置导入。
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         mimo = try values.decodeIfPresent(MiMoTTSConfiguration.self, forKey: .mimo)
+        edge = try values.decodeIfPresent(EdgeTTSConfiguration.self, forKey: .edge)
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         id = (try? values.decode(Int64.self, forKey: .id))
             ?? Int64((try? values.decode(String.self, forKey: .id)) ?? "")

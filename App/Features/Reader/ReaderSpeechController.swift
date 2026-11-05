@@ -300,7 +300,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         try Task.checkCancellation()
         let value = try AVAudioPlayer(data: audio.data)
         guard value.prepareToPlay() else { throw CocoaError(.fileReadCorruptFile) }
-        let fileURL = directory.appendingPathComponent(UUID().uuidString + (engine.mimo != nil ? ".wav" : ".audio"))
+        let fileURL = directory.appendingPathComponent(UUID().uuidString + (engine.mimo != nil ? ".wav" : engine.edge != nil ? ".mp3" : ".audio"))
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             createdDirectory = true

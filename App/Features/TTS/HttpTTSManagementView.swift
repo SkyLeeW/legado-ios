@@ -127,7 +127,7 @@ struct HttpTTSManagementView: View {
                 } label: {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(engine.name).foregroundStyle(.primary)
-                        Text(engine.url).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        Text(engine.edge?.voice ?? engine.url).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                     }
                 }
             }
@@ -143,6 +143,7 @@ struct HttpTTSManagementView: View {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Menu("新建", systemImage: "plus") {
                     Button("小米 MiMo 渠道") { editing = .miMoEngine() }
+                    Button("Microsoft Edge 渠道") { editing = .edgeEngine() }
                     Button("自定义 HTTP 引擎") { editing = HttpTTS() }
                 }
                 Menu("更多", systemImage: "ellipsis.circle") {
@@ -172,6 +173,10 @@ struct HttpTTSManagementView: View {
                 if let configuration = engine.mimo {
                     MiMoTTSEditorView(engine: engine, configuration: configuration) { value, apiKey in
                         try await model.saveMiMo(value, apiKey: apiKey)
+                    }
+                } else if let configuration = engine.edge {
+                    EdgeTTSEditorView(engine: engine, configuration: configuration) { value in
+                        await model.save(value)
                     }
                 } else {
                     HttpTTSEditorView(engine: engine) { value in
@@ -358,6 +363,113 @@ private struct MiMoTTSEditorView: View {
             }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+}
+
+
+/// Edge 渠道只开放音色选择，保存后可在现有听书引擎列表中使用。
+@MainActor
+private struct EdgeTTSEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    private let engine: HttpTTS
+    private let onSave: @MainActor (HttpTTS) async -> Void
+    @State private var voice: String
+    @State private var voices: [EdgeTTSVoice] = []
+    @State private var isSaving = false
+    @State private var isLoadingVoices = false
+    @State private var errorMessage: String?
+    @StateObject private var speech = ReaderSpeechController()
+
+    /// 使用已保存的音色初始化表单，打开页面时向官方接口拉取音色列表。
+    init(engine: HttpTTS, configuration: EdgeTTSConfiguration, onSave: @escaping @MainActor (HttpTTS) async -> Void) {
+        self.engine = engine
+        self.onSave = onSave
+        _voice = State(initialValue: configuration.voice)
+    }
+
+    var body: some View {
+        Form {
+            Section("Microsoft Edge 渠道") {
+                if isLoadingVoices {
+                    ProgressView("正在加载音色…")
+                } else if voices.isEmpty {
+                    Text(voice)
+                } else {
+                    Picker("音色", selection: $voice) {
+                        ForEach(voices) { item in
+                            Text(item.locale.isEmpty ? item.displayName : "\(item.locale) · \(item.displayName)").tag(item.shortName)
+                        }
+                    }
+                }
+            }
+            .disabled(isSaving)
+            Section {
+                if speech.isSpeaking || speech.isPaused {
+                    Button("停止试听", systemImage: "stop.fill") { speech.stop() }
+                } else {
+                    Button("保存并试听", systemImage: "play.fill") {
+                        Task { await save(closesEditor: false) }
+                    }
+                    .disabled(voice.isEmpty || isSaving)
+                }
+                if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                if let error = speech.errorMessage { Text(error).foregroundStyle(.red) }
+            } footer: {
+                Text("使用 Microsoft Edge 在线朗读接口，无需密钥。音色列表来自官方 voices/list。")
+            }
+        }
+        .navigationTitle("Microsoft Edge")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("关闭") { dismiss() }.disabled(isSaving)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button(isSaving ? "保存中…" : "保存") {
+                    Task { await save(closesEditor: true) }
+                }
+                .disabled(voice.isEmpty || isSaving)
+            }
+        }
+        .task { await loadVoices() }
+        .onChange(of: voice) { _ in speech.stop() }
+        .onDisappear { speech.stop() }
+        .interactiveDismissDisabled(isSaving)
+    }
+
+    /// 从官方接口拉取音色；失败时保留当前短名并显示原因。
+    @MainActor
+    private func loadVoices() async {
+        isLoadingVoices = true
+        errorMessage = nil
+        defer { isLoadingVoices = false }
+        do {
+            voices = try await HttpTTSService().edgeVoices()
+            voices.sort { $0.locale == $1.locale ? $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending : $0.locale < $1.locale }
+            if !voices.contains(where: { $0.shortName == voice }), !voice.isEmpty {
+                voices.insert(EdgeTTSVoice(name: voice, shortName: voice, gender: "", locale: "", friendlyName: nil), at: 0)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// 保存音色后关闭页面或朗读固定示例。
+    @MainActor
+    private func save(closesEditor: Bool) async {
+        isSaving = true
+        errorMessage = nil
+        speech.stop()
+        defer { isSaving = false }
+        var value = engine
+        value.edge = EdgeTTSConfiguration(voice: voice)
+        await onSave(value)
+        if closesEditor {
+            dismiss()
+        } else {
+            speech.configure(followsSystemRate: false, speechRate: 5, readByPage: true, streamsHTTPAudio: false)
+            speech.speakHTTP(engine: value, text: "你好，这是微软 Edge 的听书声音。愿每一个故事，都能陪你度过美好的时光。", cachePolicy: .reload)
         }
     }
 }
