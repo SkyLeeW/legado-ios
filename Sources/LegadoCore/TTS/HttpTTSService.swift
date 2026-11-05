@@ -121,8 +121,27 @@ public actor HttpTTSService {
         networkPolicy: SourceNetworkPolicy = .shared,
         transport: any HTTPTransport = URLSessionHTTPTransport(),
         cache: HttpTTSAudioCache = .shared,
+        miMoAPIKey: @escaping @Sendable (Int64) throws -> String? = { try MiMoTTSKeychain.load(engineID: $0) }
+    ) {
+        self.init(
+            urlBuilder: urlBuilder,
+            networkPolicy: networkPolicy,
+            transport: transport,
+            cache: cache,
+            miMoAPIKey: miMoAPIKey,
+            edgeWebSocket: URLSessionEdgeTTSWebSocketConnecting(),
+            edgeClock: .shared
+        )
+    }
+
+    /// 测试可替换 Edge WebSocket 与时钟，不把内部传输类型放进公开初始化入口。
+    init(
+        urlBuilder: LegadoURLBuilder = .init(),
+        networkPolicy: SourceNetworkPolicy = .shared,
+        transport: any HTTPTransport = URLSessionHTTPTransport(),
+        cache: HttpTTSAudioCache = .shared,
         miMoAPIKey: @escaping @Sendable (Int64) throws -> String? = { try MiMoTTSKeychain.load(engineID: $0) },
-        edgeWebSocket: any EdgeTTSWebSocketConnecting = URLSessionEdgeTTSWebSocketConnecting(),
+        edgeWebSocket: any EdgeTTSWebSocketConnecting,
         edgeClock: EdgeTTSClock = .shared
     ) {
         self.urlBuilder = urlBuilder
