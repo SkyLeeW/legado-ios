@@ -18,15 +18,19 @@ public enum HttpTTSServiceError: Error, LocalizedError, Sendable {
     }
 }
 
-public struct HttpTTSAudio: Sendable {
+public struct HttpTTSAudio: Codable, Sendable {
     public var data: Data
     public var contentType: String?
     public var finalURL: URL
+    /// 与音频同时缓存的真实文字时间轴，未提供时间点的渠道保留空列表。
+    public var speechBoundaries: [HttpTTSSpeechBoundary]
 
-    public init(data: Data, contentType: String?, finalURL: URL) {
+    /// 音频和可选的文字时间轴共同传递，位置以本次请求原文的 UTF-16 索引为准。
+    public init(data: Data, contentType: String?, finalURL: URL, speechBoundaries: [HttpTTSSpeechBoundary] = []) {
         self.data = data
         self.contentType = contentType
         self.finalURL = finalURL
+        self.speechBoundaries = speechBoundaries
     }
 }
 
@@ -154,11 +158,15 @@ public actor HttpTTSService {
 
     /// 按配置渠道合成可播放音频，试听时跳过已有缓存以验证实际请求。
     public func audio(engine: HttpTTS, text: String, speechRate: Int, cachePolicy: HttpTTSCachePolicy = .useCache, maximumAttempts: Int = 6, timeout: TimeInterval = 300) async throws -> HttpTTSAudio {
-        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { throw HttpTTSServiceError.emptyText }
+        // Edge 的文字时间轴必须对应原始正文，不能先删除段首空白后再套用正文位置。
+        let text = engine.edge != nil ? text : text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HttpTTSServiceError.emptyText }
         let source = engine.bookSourceAdapter
         let cacheKey = try Self.cacheKey(engine: engine, text: text, speechRate: speechRate)
         if case .useCache = cachePolicy, let data = await cache.data(for: cacheKey) {
+            if engine.edge != nil {
+                return try PropertyListDecoder().decode(HttpTTSAudio.self, from: data)
+            }
             return .init(data: data, contentType: engine.contentType, finalURL: cacheURL(engine: engine))
         }
         // MiMo 返回 JSON 包装的音频，由渠道协议解析后再缓存实际 WAV 数据。
@@ -169,7 +177,8 @@ public actor HttpTTSService {
         }
         if let configuration = engine.edge {
             let audio = try await edgeService.audio(configuration: configuration, text: text, timeout: timeout)
-            await cache.store(audio.data, for: cacheKey)
+            // MP3 和文字时间轴作为一个缓存条目保存，读取缓存也能同步翻页。
+            await cache.store(try PropertyListEncoder().encode(audio), for: cacheKey)
             return audio
         }
         let context = URLTemplateContext(
@@ -342,6 +351,8 @@ public actor HttpTTSService {
             let text: String
         }
         struct EdgeCacheInput: Encodable {
+            /// 新格式包含文字时间轴，与先前仅有 MP3 的缓存使用不同标识。
+            let formatVersion = 2
             let engineID: Int64
             let configuration: EdgeTTSConfiguration
             let text: String

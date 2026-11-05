@@ -25,17 +25,11 @@ struct EdgeTTSTests {
             == "Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoxiaoNeural)")
     }
 
-    /// 控制字符替换、XML 转义和按空白/实体边界切块必须与 Python 实现相同。
+    /// 控制字符替换和 XML 转义沿用协议规则，短文本保持原文范围。
     @Test func preparesTextLikeEdgeTTS() throws {
         #expect(EdgeTTSText.removeIncompatible("\u{00}A\u{0b}B\u{1f}C\nD") == " A B C\nD")
         #expect(EdgeTTSText.escape("路径 C:\\书籍 & 阅读 <tag>") == "路径 C:\\书籍 &amp; 阅读 &lt;tag&gt;")
-        #expect(try EdgeTTSText.split("hello &amp; world and more text to split", byteLength: 20) == [
-            "hello &amp; world", "and more text to", "split"
-        ])
-        #expect(try EdgeTTSText.split("xxxxx &yyyyy zzzzzzzzz", byteLength: 12) == ["xxxxx", "yyyyy", "zzzzzzzzz"])
-        #expect(try EdgeTTSText.split("aaa😀bbb", byteLength: 6) == ["aaa😀bbb"])
-        #expect(try EdgeTTSText.split("aaaa\nbbbbcccc", byteLength: 8) == ["aaaa", "bbbbcccc"])
-        #expect(try EdgeTTSText.prepare("短句") == ["短句"])
+        #expect(EdgeTTSText.chunks("短句") == [.init(escapedText: "短句", range: NSRange(location: 0, length: 2))])
     }
 
     /// 合成请求发送 speech.config 与 SSML，并把二进制 MP3 帧拼接为完整音频。
@@ -43,6 +37,7 @@ struct EdgeTTSTests {
         let audio = Data("MP3DATA".utf8)
         let socket = QueueSocket(messages: [
             .text("Path:turn.start\r\n\r\n"),
+            .text("Path:audio.metadata\r\n\r\n{\"Metadata\":[{\"Type\":\"WordBoundary\",\"Data\":{\"Offset\":1000000,\"text\":{\"Text\":\"你好\"}}}]}"),
             .data(audioFrame(audio)),
             .text("Path:turn.end\r\n\r\n")
         ])
@@ -59,10 +54,12 @@ struct EdgeTTSTests {
         let value = try await service.audio(configuration: .init(voice: "zh-CN-XiaoxiaoNeural"), text: "你好")
         #expect(value.data == audio)
         #expect(value.contentType == "audio/mpeg")
+        #expect(value.speechBoundaries == [.init(offsetTicks: 1_000_000, range: NSRange(location: 0, length: 2))])
         let sent = socket.sentTexts()
         #expect(sent.count == 2)
         #expect(sent[0].contains("Path:speech.config"))
         #expect(sent[0].contains("audio-24khz-48kbitrate-mono-mp3"))
+        #expect(sent[0].contains("\"wordBoundaryEnabled\":\"true\""))
         #expect(sent[1].contains("Path:ssml"))
         #expect(sent[1].contains("Microsoft Server Speech Text to Speech Voice (zh-CN, XiaoxiaoNeural)"))
         #expect(sent[1].contains("你好"))
@@ -128,6 +125,23 @@ struct EdgeTTSTests {
         }
     }
 
+    /// 段首空白必须保留在请求与时间轴中，否则定位正文时会提前翻页。
+    @Test func preservesLeadingWhitespaceInSpeechPositions() async throws {
+        let socket = QueueSocket(messages: [
+            .text("Path:audio.metadata\r\n\r\n{\"Metadata\":[{\"Type\":\"WordBoundary\",\"Data\":{\"Offset\":1000000,\"text\":{\"Text\":\"你好\"}}}]}"),
+            .data(audioFrame(Data("audio".utf8))), .text("Path:turn.end\r\n\r\n")
+        ])
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            do { try FileManager.default.removeItem(at: directory) }
+            catch { Issue.record(error) }
+        }
+        let service = HttpTTSService(cache: .init(directory: directory), edgeWebSocket: QueueConnecting(results: [.success(socket)]))
+        let audio = try await service.audio(engine: .edgeEngine(), text: "  你好\n", speechRate: 5)
+        #expect(audio.speechBoundaries.first?.range.location == 2)
+        #expect(socket.sentTexts()[1].contains(">  你好\n</prosody>"))
+    }
+
     /// 音色列表请求带令牌，解码官方 JSON 字段。
     @Test func listsOfficialVoices() async throws {
         let body = Data("""
@@ -157,7 +171,10 @@ struct EdgeTTSTests {
     /// 通用听书入口走 Edge 协议，缓存按音色和正文区分，不受保存时间影响。
     @Test func reusesDecodedCacheAndSeparatesVoices() async throws {
         let audio = Data("edge-audio".utf8)
-        let socket = QueueSocket(messages: [.data(audioFrame(audio)), .text("Path:turn.end\r\n\r\n")])
+        let socket = QueueSocket(messages: [
+            .text("Path:audio.metadata\r\n\r\n{\"Metadata\":[{\"Type\":\"WordBoundary\",\"Data\":{\"Offset\":1000000,\"text\":{\"Text\":\"第一段\"}}}]}"),
+            .data(audioFrame(audio)), .text("Path:turn.end\r\n\r\n")
+        ])
         let connecting = QueueConnecting(results: [.success(socket), .success(QueueSocket(messages: [.data(audioFrame(Data("other".utf8))), .text("Path:turn.end\r\n\r\n")]))])
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -173,6 +190,8 @@ struct EdgeTTSTests {
         engine.lastUpdateTime += 1
         let cached = try await service.audio(engine: engine, text: "第一段", speechRate: 10)
         #expect(cached.data == audio)
+        #expect(cached.speechBoundaries == first.speechBoundaries)
+        #expect(cached.speechBoundaries.count == 1)
         #expect(connecting.urls().count == 1)
         engine.edge = .init(voice: "zh-CN-YunxiNeural")
         _ = try await service.audio(engine: engine, text: "第一段", speechRate: 10)
@@ -198,14 +217,13 @@ struct EdgeTTSTests {
     }
 }
 
-/// 构造 Path 为 audio 的二进制帧，正文前留 2 字节以匹配 edge-tts 的 headerLength 切分。
+/// 按真实服务端定义构造二进制帧，头部长度包含末尾 CRLF，但不包含长度字段自身。
 private func audioFrame(_ payload: Data) -> Data {
-    let header = Data("X-RequestId:abc\r\nContent-Type:audio/mpeg\r\nPath:audio".utf8)
+    let header = Data("X-RequestId:abc\r\nContent-Type:audio/mpeg\r\nPath:audio\r\n".utf8)
     var message = Data()
-    var headerLength = UInt16(2 + header.count).bigEndian
+    var headerLength = UInt16(header.count).bigEndian
     message.append(Data(bytes: &headerLength, count: 2))
     message.append(header)
-    message.append(contentsOf: [0, 0])
     message.append(payload)
     return message
 }

@@ -380,8 +380,11 @@ struct ReaderView: View {
             readerJumpPosition = nil
             DispatchQueue.main.async { readerJumpPosition = model.paragraphs[index].id }
         }
-        .onChange(of: speech.currentHTTPUnit) { unit in
-            if let unit { followHTTPAudio(unit) }
+        .onChange(of: speech.currentHTTPPosition) { position in
+            if let position, speech.isSpeaking { followHTTPAudio(position) }
+        }
+        .onChange(of: ttsFollowAudio) { enabled in
+            if enabled, let position = speech.currentHTTPPosition { followHTTPAudio(position) }
         }
         .onChange(of: readAloudByPage) { _ in
             if selectedHTTPEngine == nil { restartSpeechAfterReaderLayoutChange() }
@@ -2175,8 +2178,8 @@ struct ReaderView: View {
         }
     }
 
-    /// 音频开始播放后才同步章节；仅在用户开启跟随且位置离开当前页时翻页。
-    private func followHTTPAudio(_ unit: ReaderHTTPSpeechUnit) {
+    /// 按实际朗读位置同步章节与页面，同一份缓存中的词边界也可触发翻页。
+    private func followHTTPAudio(_ unit: ReaderHTTPSpeechPosition) {
         guard ttsFollowAudio else { return }
         if unit.chapterIndex != model.currentIndex {
             saveProgress(immediate: true)

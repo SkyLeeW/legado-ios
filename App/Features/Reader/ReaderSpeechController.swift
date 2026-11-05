@@ -39,6 +39,12 @@ struct ReaderHTTPSpeechUnit: Identifiable, Equatable, Sendable {
     }
 }
 
+/// 当前音频的章节及 UTF-16 位置独立于缓存单位，词边界变化即可通知阅读页。
+struct ReaderHTTPSpeechPosition: Equatable {
+    let chapterIndex: Int
+    let position: Int
+}
+
 /// 连续听书使用单一生成队列和滑动缓存窗口，播放器换段不会取消生成任务。
 @MainActor
 private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlayerDelegate {
@@ -50,6 +56,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private struct Prepared {
         let engine: HttpTTS
         let fileURL: URL
+        let speechBoundaries: [HttpTTSSpeechBoundary]
     }
     private let service: HttpTTSService
     private let channels: [HttpTTS]
@@ -66,6 +73,8 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private var worker: Task<Void, Never>?
     private var workerID = UUID()
     private var recoveryTimer: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
+    private var reportedPosition: ReaderHTTPSpeechPosition?
     private var recoveryProbe: Task<Void, Never>?
     private var probingEngineID: Int64?
     private var waitingForChannels = false
@@ -83,6 +92,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private(set) var isPaused = false
     var onStatus: ((String, Bool) -> Void)?
     var onAdvance: ((ReaderHTTPSpeechUnit) -> Void)?
+    var onPosition: ((ReaderHTTPSpeechPosition) -> Void)?
     var onComplete: ((ReaderHTTPSpeechUnit) -> Void)?
     var onNeedMore: (() -> Void)?
     var onError: ((String?) -> Void)?
@@ -104,6 +114,20 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 首次启动仅等待第一份音频，其余缓存会在播放期间按顺序补足。
     func start() {
+        // 读取播放器实际时间，暂停和等待音频期间不推进文字位置。
+        progressTask = Task { [weak self] in
+            do {
+                while true {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                    guard let self else { return }
+                    self.reportPlaybackPosition()
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.onError?(error.localizedDescription)
+            }
+        }
         recoveryTimer = Task { [weak self] in
             do {
                 while true {
@@ -186,6 +210,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         stopped = true
         worker?.cancel()
         recoveryTimer?.cancel()
+        progressTask?.cancel()
         recoveryProbe?.cancel()
         player?.stop()
         player = nil
@@ -305,7 +330,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             createdDirectory = true
             try audio.data.write(to: fileURL, options: .atomic)
-            return Prepared(engine: engine, fileURL: fileURL)
+            return Prepared(engine: engine, fileURL: fileURL, speechBoundaries: audio.speechBoundaries)
         } catch {
             throw CacheWriteError(underlying: error)
         }
@@ -417,7 +442,21 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             return
         }
         onAdvance?(units[index])
+        reportedPosition = ReaderHTTPSpeechPosition(chapterIndex: units[index].chapterIndex, position: units[index].position)
         publishStatus()
+    }
+
+    /// 用词边界定位同一份缓存内的正文，读到下一页时即可同步画面。
+    private func reportPlaybackPosition() {
+        guard !stopped, !isPaused, let player, player.isPlaying else { return }
+        let unit = units[index]
+        let value = prepared[unit.id]!
+        guard let offset = HttpTTSSpeechBoundary.position(at: player.currentTime, in: value.speechBoundaries) else { return }
+        let position = ReaderHTTPSpeechPosition(chapterIndex: unit.chapterIndex, position: unit.position + offset)
+        if position != reportedPosition {
+            reportedPosition = position
+            onPosition?(position)
+        }
     }
 
     /// 播放失败从同一份正文重新选择渠道，不触发下一段或下一章的进度。
@@ -577,11 +616,12 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     @Published private(set) var currentSegmentIndex = 0
     @Published private(set) var channelStatus = ""
     @Published private(set) var currentHTTPUnit: ReaderHTTPSpeechUnit?
+    @Published private(set) var currentHTTPPosition: ReaderHTTPSpeechPosition?
     @Published private(set) var isBuffering = false
     private var continuousHTTPQueue: ReaderHTTPSpeechQueue?
     var onNeedHTTPChapters: (() -> Void)?
     var onHTTPProgress: (() -> Void)?
-    private(set) var httpProgress: (chapterIndex: Int, position: Int)?
+    private(set) var httpProgress: ReaderHTTPSpeechPosition?
     private let synthesizer = AVSpeechSynthesizer()
     private let httpService = HttpTTSService()
     private var audioPlayer: AVAudioPlayer?
@@ -673,6 +713,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         continuousHTTPQueue?.stop()
         continuousHTTPQueue = nil
         currentHTTPUnit = nil
+        currentHTTPPosition = nil
         httpProgress = nil
         isBuffering = false
         recoveryTask?.cancel()
@@ -823,15 +864,20 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
             self.updateNowPlaying()
         }
         queue.onAdvance = { [weak self] unit in
-            self?.httpProgress = (unit.chapterIndex, unit.position)
+            self?.httpProgress = .init(chapterIndex: unit.chapterIndex, position: unit.position)
+            self?.currentHTTPPosition = .init(chapterIndex: unit.chapterIndex, position: unit.position)
             self?.onHTTPProgress?()
             self?.chapterTitle = unit.chapterTitle
             self?.currentHTTPUnit = unit
             self?.updateNowPlaying()
         }
         queue.onComplete = { [weak self] unit in
-            self?.httpProgress = (unit.chapterIndex, unit.position + unit.text.utf16.count)
+            self?.httpProgress = .init(chapterIndex: unit.chapterIndex, position: unit.position + unit.text.utf16.count)
             self?.onHTTPProgress?()
+        }
+        queue.onPosition = { [weak self] position in
+            self?.httpProgress = position
+            self?.currentHTTPPosition = position
         }
         queue.onNeedMore = { [weak self] in self?.onNeedHTTPChapters?() }
         queue.onError = { [weak self] error in self?.errorMessage = error }
