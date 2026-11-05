@@ -77,6 +77,7 @@ public struct ContentProcessingReport: Sendable {
     public var effectiveRuleIDs: [Int64]
     public var removedDuplicateTitle: Bool
     public var diagnostics: [RuleDiagnostic]
+    public var sourceMap: TextSourceMap? = nil
 
     public init(
         title: String,
@@ -100,17 +101,20 @@ public struct ContentSanitizer: Sendable {
         self.regex = regex
     }
 
+    /// 按既有顺序净化标题和正文，可同步记录每个输出字符在原文中的来源位置。
     public func process(
         book: Book,
         chapter: BookChapter,
         content: String,
         rules: [ReplaceRule],
         removeDuplicateTitle: Bool = true,
-        resegment: Bool = true
+        resegment: Bool = true,
+        tracksSourceOffsets: Bool = false
     ) -> ContentProcessingReport {
         let ordered = rules.filter(\.isEnabled).sorted { $0.sortOrder == $1.sortOrder ? $0.id < $1.id : $0.sortOrder < $1.sortOrder }
         var title = chapter.title
         var body = content
+        var bodyMap = tracksSourceOffsets ? TextSourceMap(content) : nil
         var effective: [Int64] = []
         var diagnostics: [RuleDiagnostic] = []
 
@@ -133,6 +137,11 @@ public struct ContentSanitizer: Sendable {
                     var updated = lines
                     updated.remove(at: firstIndex)
                     body = updated.joined(separator: "\n")
+                    var start = lines[..<firstIndex].reduce(0) { $0 + $1.utf16.count + 1 }
+                    var length = lines[firstIndex].utf16.count
+                    if firstIndex < lines.count - 1 { length += 1 }
+                    else if firstIndex > 0 { start -= 1; length += 1 }
+                    bodyMap?.replace([.init(range: NSRange(location: start, length: length), text: "")])
                     removed = true
                 }
             }
@@ -143,6 +152,7 @@ public struct ContentSanitizer: Sendable {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "　"))) }
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n")
+            bodyMap?.trimLines()
         }
 
         for rule in ordered where rule.scopeContent && applies(rule, to: book) {
@@ -150,19 +160,22 @@ public struct ContentSanitizer: Sendable {
             diagnostics += result.diagnostics
             if result.value != body {
                 body = result.value
+                bodyMap?.replace(result.edits)
                 effective.append(rule.id)
             }
         }
 
         var seen = Set<Int64>()
         effective = effective.filter { seen.insert($0).inserted }
-        return .init(
+        var report = ContentProcessingReport(
             title: title,
             content: body,
             effectiveRuleIDs: effective,
             removedDuplicateTitle: removed,
             diagnostics: diagnostics
         )
+        report.sourceMap = bodyMap
+        return report
     }
 
     private func applies(_ rule: ReplaceRule, to book: Book) -> Bool {
@@ -172,28 +185,44 @@ public struct ContentSanitizer: Sendable {
         return (!book.name.isEmpty && scope.contains(book.name)) || (!book.origin.isEmpty && scope.contains(book.origin))
     }
 
-    private func apply(_ rule: ReplaceRule, to input: String, book: Book, chapter: BookChapter) -> (value: String, diagnostics: [RuleDiagnostic]) {
-        guard !rule.pattern.isEmpty else { return (input, []) }
+    /// 净化规则同时返回真实替换范围，EPUB 同步位置无需重新匹配或重复执行脚本。
+    private func apply(_ rule: ReplaceRule, to input: String, book: Book, chapter: BookChapter) -> (value: String, diagnostics: [RuleDiagnostic], edits: [TextReplacement]) {
+        guard !rule.pattern.isEmpty else { return (input, [], []) }
+        var edits: [TextReplacement] = []
+        let record: (NSRange, String) -> Void = { edits.append(.init(range: $0, text: $1)) }
         do {
             if rule.isRegex {
                 if rule.replacement.hasPrefix("@js:") {
                     let evaluate = JavaScriptRuleEvaluator().replacementEvaluator(
                         script: String(rule.replacement.dropFirst(4)), book: book, chapter: chapter)
-                    return (try regex.replacingStrict(pattern: rule.pattern, in: input,
-                        timeoutMilliseconds: rule.timeoutMillisecond, replacement: evaluate), [])
+                    let value = try regex.replacingStrict(pattern: rule.pattern, in: input,
+                        timeoutMilliseconds: rule.timeoutMillisecond, onReplacement: record, replacement: evaluate)
+                    return (value, [], edits)
                 }
-                return (try regex.replacingStrict(pattern: rule.pattern, in: input, with: rule.replacement, timeoutMilliseconds: rule.timeoutMillisecond), [])
+                let value = try regex.replacingStrict(pattern: rule.pattern, in: input, timeoutMilliseconds: rule.timeoutMillisecond,
+                                                     onReplacement: record) { expression, match in
+                    expression.replacementString(for: match, in: input, offset: 0, template: rule.replacement)
+                }
+                return (value, [], edits)
             }
-            return (input.replacingOccurrences(of: rule.pattern, with: rule.replacement), [])
+            let original = input as NSString
+            var cursor = 0
+            while cursor < original.length {
+                let range = original.range(of: rule.pattern, range: NSRange(location: cursor, length: original.length - cursor))
+                if range.location == NSNotFound { break }
+                record(range, rule.replacement)
+                cursor = NSMaxRange(range)
+            }
+            return (input.replacingOccurrences(of: rule.pattern, with: rule.replacement), [], edits)
         } catch let error as RuleEngineError {
-            return (input, [error.diagnostic])
+            return (input, [error.diagnostic], [])
         } catch {
             return (input, [.init(
                 severity: .error,
                 code: "replace.failed",
                 message: "净化规则“\(rule.name)”执行失败：\(error.localizedDescription)",
                 rule: rule.pattern
-            )])
+            )], [])
         }
     }
 

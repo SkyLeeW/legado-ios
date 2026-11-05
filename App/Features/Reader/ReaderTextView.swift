@@ -1,6 +1,66 @@
 import SwiftUI
 import UIKit
 
+/// 屏幕分页和听书预排共同使用 TextKit 的真实字形范围，避免按字数估算页边界。
+@MainActor
+enum ReaderPageLayout {
+    /// 按阅读器的滚动边界逐页提取正文范围，保留末页与前页重叠的可见内容。
+    static func ranges(in view: UITextView, prefix: Int, bodyLength: Int, pageHeight: CGFloat,
+                       minimum: CGFloat, maximum: CGFloat, total: Int) -> [NSRange] {
+        var ranges: [NSRange] = []
+        for page in 0..<total {
+            let offset = page == total - 1 ? maximum : min(minimum + CGFloat(page) * pageHeight, maximum)
+            let rect = CGRect(x: 0, y: max(0, offset + view.textContainerInset.top),
+                              width: view.textContainer.size.width, height: pageHeight)
+            let glyphs = view.layoutManager.glyphRange(forBoundingRect: rect, in: view.textContainer)
+            guard glyphs.length > 0 else { continue }
+            let characters = view.layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            let start = max(characters.location - prefix, 0)
+            let end = min(NSMaxRange(characters) - prefix, bodyLength)
+            guard end > start else { continue }
+            let range = NSRange(location: start, length: end - start)
+            if ranges.last != range { ranges.append(range) }
+        }
+        return ranges
+    }
+}
+
+extension ReaderTextView {
+    /// 用当前视口及同一套字体样式预排后续章节，为没有文字时间轴的渠道生成逐页音频。
+    @MainActor
+    func speechPageRanges(chapter: ReaderScrollChapter, size: CGSize) -> [NSRange] {
+        if pageAnimation == 3 {
+            return ReaderScrollChapterLayout(chapter: chapter, configuration: self, width: size.width)
+                .pageRanges(height: size.height)
+        }
+        let storage = NSTextStorage()
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: CGSize(width: size.width, height: .greatestFiniteMagnitude))
+        storage.addLayoutManager(manager)
+        manager.addTextContainer(container)
+        let view = UITextView(frame: CGRect(origin: .zero, size: size), textContainer: container)
+        view.contentInsetAdjustmentBehavior = .never
+        view.textContainer.lineFragmentPadding = 4
+        view.textContainerInset = .init(top: paddingTop + headerInset, left: paddingLeft,
+                                       bottom: paddingBottom + footerInset, right: paddingRight)
+        let typography = ReaderTypography(configuration: self)
+        let rendered = NSMutableAttributedString(string: "")
+        if titleMode != 2 || isVolume, !chapter.title.isEmpty {
+            rendered.append(NSAttributedString(string: chapter.title + "\n", attributes: typography.headingAttributes))
+        }
+        let prefix = rendered.length
+        rendered.append(NSAttributedString(string: chapter.content, attributes: typography.bodyAttributes))
+        view.attributedText = rendered
+        view.layoutManager.ensureLayout(for: view.textContainer)
+        view.layoutIfNeeded()
+        let height = max(size.height - view.textContainerInset.top - view.textContainerInset.bottom, 1)
+        let maximum = max(view.contentSize.height - size.height, 0)
+        return ReaderPageLayout.ranges(in: view, prefix: prefix, bodyLength: chapter.content.utf16.count,
+                                     pageHeight: height, minimum: 0, maximum: maximum,
+                                     total: Int(ceil(maximum / height)) + 1)
+    }
+}
+
 private final class ReaderLayoutTextView: UITextView {
     var onLayout: ((UITextView) -> Void)?
     private var reportedSize = CGSize.zero
@@ -599,6 +659,7 @@ struct ReaderTextView: UIViewRepresentable {
             }
         }
 
+        /// 将显示分页使用的真实字形范围回传给阅读进度和逐页听书计划。
         func reportPageRanges(in view: UITextView) {
             guard view.bounds.width > 0, view.bounds.height > 0 else { return }
             if parent.pageAnimation == 3 {
@@ -614,37 +675,10 @@ struct ReaderTextView: UIViewRepresentable {
             let pageHeight = readingViewportHeight(for: view)
             let limits = scrollLimits(for: view)
             let metrics = pageMetrics(for: view)
-            var ranges: [NSRange] = []
-            for page in 0..<metrics.total {
-                let offset = page == metrics.total - 1
-                    ? limits.maximum
-                    : min(limits.minimum + CGFloat(page) * pageHeight, limits.maximum)
-                let rect = CGRect(
-                    x: 0,
-                    y: max(0, offset + view.textContainerInset.top),
-                    width: max(view.textContainer.size.width, 1),
-                    height: pageHeight
-                )
-                let glyphRange = view.layoutManager.glyphRange(
-                    forBoundingRect: rect,
-                    in: view.textContainer
-                )
-                guard glyphRange.length > 0 else { continue }
-                let characterRange = view.layoutManager.characterRange(
-                    forGlyphRange: glyphRange,
-                    actualGlyphRange: nil
-                )
-                let start = max(characterRange.location - renderedPrefixLength, 0)
-                let end = min(
-                    characterRange.location + characterRange.length - renderedPrefixLength,
-                    parent.text.utf16.count
-                )
-                guard end > start else { continue }
-                let range = NSRange(location: start, length: end - start)
-                if ranges.last?.location == range.location,
-                   ranges.last?.length == range.length { continue }
-                ranges.append(range)
-            }
+            let ranges = ReaderPageLayout.ranges(in: view, prefix: renderedPrefixLength,
+                                               bodyLength: parent.text.utf16.count,
+                                               pageHeight: pageHeight, minimum: limits.minimum,
+                                               maximum: limits.maximum, total: metrics.total)
             if ranges.isEmpty {
                 guard pageRangeRetryCount < 10 else { return }
                 pageRangeRetryCount += 1

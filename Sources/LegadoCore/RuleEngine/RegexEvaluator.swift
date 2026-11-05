@@ -117,19 +117,21 @@ public struct RegexEvaluator: Sendable {
         }
     }
 
-    /// Legado's JS replacement still expands capture references, while quoting
-    /// backslashes returned by the script (quoteReplacementJs in the reference).
+    /// 脚本替换仍展开捕获组，并转义脚本返回的反斜杠；位置映射复用本次执行结果。
     func replacingStrict(pattern: String, in input: String, timeoutMilliseconds: Int64 = 3_000,
+                         onReplacement: ((NSRange, String) -> Void)? = nil,
                          replacement: (String) throws -> String) throws -> String {
         let original = input as NSString
-        return try replacingStrict(pattern: pattern, in: input, timeoutMilliseconds: timeoutMilliseconds) { expression, match in
+        return try replacingStrict(pattern: pattern, in: input, timeoutMilliseconds: timeoutMilliseconds, onReplacement: onReplacement) { expression, match in
             let template = try replacement(original.substring(with: match.range))
                 .replacingOccurrences(of: "\\", with: "\\\\")
             return expression.replacementString(for: match, in: input, offset: 0, template: template)
         }
     }
 
-    private func replacingStrict(pattern: String, in input: String, timeoutMilliseconds: Int64,
+    /// 在实际替换时报告原文范围，使位置映射复用同一次正则和脚本执行结果。
+    func replacingStrict(pattern: String, in input: String, timeoutMilliseconds: Int64,
+                                 onReplacement: ((NSRange, String) -> Void)? = nil,
                                  replacement: (NSRegularExpression, NSTextCheckingResult) throws -> String) throws -> String {
         guard pattern.count <= limits.maximumPatternLength, input.utf16.count <= limits.maximumInputLength,
               !hasObviousNestedQuantifier(pattern) else {
@@ -165,6 +167,7 @@ public struct RegexEvaluator: Sendable {
             }
             let untouched = original.substring(with: NSRange(location: offset, length: match.range.location - offset))
             let replaced = try replacement(expression, match)
+            onReplacement?(match.range, replaced)
             guard DispatchTime.now().uptimeNanoseconds < deadline else {
                 throw RuleEngineError.resourceLimit(rule: pattern, detail: "正则替换超时（\(milliseconds) ms）")
             }

@@ -28,6 +28,7 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
     let initialIndex: Int
     private let httpClient = DefaultHTTPClient()
     private var navigationAdapter: DirectionalNavigationAdapter?
+    private var textMaps: [Int: EPUBTextMap] = [:]
 
     init(book: Book, chapters: [BookChapter], initialIndex: Int) {
         self.book = book
@@ -122,11 +123,86 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
         _ = await navigator.go(to: locator)
     }
 
+    /// 返回原排版时使用听书刚保存的正文 Locator，恢复到章内实际位置。
     func resumeAfterTextReading(_ updated: Book) async {
-        guard updated.readConfig?.epubLocation == nil,
-              let chapter = chapters.first(where: { $0.index == updated.durChapterIndex }), let link = link(for: chapter) else { return }
-        await go(to: link)
+        do {
+            let locator = try Locator(jsonString: updated.readConfig!.epubLocation!)
+            if !(await navigator!.go(to: locator)) { errorMessage = "无法恢复听书位置" }
+        } catch { errorMessage = error.localizedDescription }
     }
+
+    /// 将原排版中首个可见字符转换成听书使用的正文坐标，并生成可反向恢复的 Locator。
+    func readingBook(_ current: Book, rules: [ReplaceRule]) async throws -> Book {
+        let locator = location!
+        let value = try await navigator!.evaluateJavaScript(Self.visibleTextPointScript).get()
+        let point = try JSONDecoder().decode(EPUBTextPoint.self, from: Data((value as! String).utf8))
+        let path = Self.path(locator.href.string)
+        let candidates = chapters.filter { $0.resourceUrl == path }
+        for chapter in candidates {
+            let raw: EPUBTextMap
+            if let cached = textMaps[chapter.index] { raw = cached }
+            else {
+                raw = try await Task.detached {
+                    try LocalBookService().loadContent(book: current, chapter: chapter).epubTextMap!
+                }.value
+                textMaps[chapter.index] = raw
+            }
+            if let rawPosition = raw.position(of: point) {
+                let processed = ContentSanitizer().process(book: current, chapter: chapter, content: raw.text,
+                    rules: (current.readConfig?.useReplaceRule ?? true) ? rules : [], tracksSourceOffsets: true)
+                let position = processed.sourceMap!.position(forSourceOffset: rawPosition)
+                var result = current
+                result.durChapterIndex = chapter.index
+                result.durChapterTitle = chapter.title
+                result.durChapterPos = position
+                if result.readConfig == nil { result.readConfig = BookReadConfig() }
+                result.readConfig!.epubLocation = try raw.processed(processed).locatorJSON(chapter: chapter, position: position)
+                return result
+            }
+        }
+        throw NSError(domain: "Legado.EPUBPosition", code: 1, userInfo: [NSLocalizedDescriptionKey: "当前页面没有可同步的正文位置"])
+    }
+
+    /// 通过实际字符矩形寻找当前可见正文，不使用页码比例或文本搜索猜测位置。
+    private static let visibleTextPointScript = #"""
+    (() => {
+        // 元素路径与原始 DOM 的子元素顺序一致，不依赖书籍是否为段落设置 id。
+        function selector(element) {
+            if (element === document.body) return 'body';
+            return selector(element.parentElement) + ' > :nth-child(' +
+                (Array.from(element.parentElement.children).indexOf(element) + 1) + ')';
+        }
+        // 多栏和滚动排版均以字形矩形与视口相交作为可见条件。
+        function visible(rect) {
+            return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < innerWidth &&
+                rect.bottom > 0 && rect.top < innerHeight;
+        }
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+        const range = document.createRange();
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            if (node.nodeType === Node.ELEMENT_NODE && ['img', 'image'].includes(node.localName) &&
+                Array.from(node.getClientRects()).some(visible)) {
+                return JSON.stringify({cssSelector: selector(node), textNodeIndex: -1, offset: 0});
+            }
+            if (node.nodeType !== Node.TEXT_NODE || node.parentElement.closest('script,style,noscript,rt,rp,title,[hidden]')) continue;
+            if (getComputedStyle(node.parentElement).visibility !== 'visible') continue;
+            range.selectNodeContents(node);
+            if (!Array.from(range.getClientRects()).some(visible)) continue;
+            for (let offset = 0; offset < node.length;) {
+                const character = String.fromCodePoint(node.textContent.codePointAt(offset));
+                range.setStart(node, offset);
+                range.setEnd(node, offset + character.length);
+                if (!/\s/u.test(character) && Array.from(range.getClientRects()).some(visible)) {
+                    return JSON.stringify({cssSelector: selector(node.parentElement),
+                        textNodeIndex: Array.from(node.parentElement.childNodes).indexOf(node), offset});
+                }
+                offset += character.length;
+            }
+        }
+        throw new Error('当前 EPUB 页面没有可见正文或插图');
+    })()
+    """#
 
     func navigator(_ navigator: Navigator, locationDidChange locator: Locator) {
         location = locator
@@ -138,6 +214,9 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
     }
 
     func clearError() { errorMessage = nil }
+
+    /// 位置同步失败直接显示原因，保留当前阅读画面供用户重试。
+    func reportPositionError(_ error: Error) { errorMessage = error.localizedDescription }
 
     private func link(for chapter: BookChapter) -> ReadiumShared.Link? {
         guard let path = chapter.resourceUrl else { return nil }
@@ -159,11 +238,16 @@ struct EPUBReaderView: View {
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var library: BookLibraryModel
     @EnvironmentObject private var activity: ReadingActivityModel
+    @EnvironmentObject private var replaceRules: ReplaceRuleLibraryModel
     @StateObject private var model: EPUBReaderModel
     @State private var showsTOC = false
     @State private var showsSettings = false
     @State private var showsBookmarks = false
     @State private var showsTextReader = false
+    @State private var textReaderBook: Book?
+    @State private var startsListening = false
+    @State private var isOpeningTextReader = false
+    @State private var isRestoringTextPosition = false
     @State private var sliderProgress = 0.0
     @State private var isScrubbing = false
     @State private var saveTask: Task<Void, Never>?
@@ -217,12 +301,12 @@ struct EPUBReaderView: View {
         .readingTabBarHidden()
         .task {
             model.onLocationChanged = { locator, chapter in
-                guard !showsTextReader else { return }
+                guard !showsTextReader, !isRestoringTextPosition else { return }
                 if !isScrubbing { sliderProgress = locator.locations.totalProgression ?? 0 }
                 saveTask?.cancel()
                 saveTask = Task {
                     do { try await Task.sleep(nanoseconds: 350_000_000) } catch { return }
-                    await library.updateProgress(for: model.book, chapter: chapter, epubLocation: locator.jsonString)
+                    await persistVisibleProgress()
                 }
             }
             activity.beginReading(model.book)
@@ -245,13 +329,19 @@ struct EPUBReaderView: View {
         .sheet(isPresented: $showsBookmarks) { bookmarksSheet }
         .fullScreenCover(isPresented: $showsTextReader, onDismiss: {
             if let book = library.books.first(where: { $0.bookUrl == model.book.bookUrl }) {
-                Task { await model.resumeAfterTextReading(book) }
+                isRestoringTextPosition = true
+                Task {
+                    await model.resumeAfterTextReading(book)
+                    isRestoringTextPosition = false
+                }
             }
             activity.beginReading(model.book)
         }) {
             ReadingNavigationStack {
-                ReaderView(book: model.book, chapters: model.chapters,
-                           initialIndex: model.currentChapter?.index ?? model.initialIndex, usesEPUBLayout: false)
+                if let book = textReaderBook {
+                    ReaderView(book: book, chapters: model.chapters, initialIndex: book.durChapterIndex,
+                               usesEPUBLayout: false, startsListening: startsListening)
+                }
             }
         }
         .alert("EPUB 阅读", isPresented: Binding(get: { model.navigator != nil && model.errorMessage != nil }, set: { if !$0 { model.clearError() } })) {
@@ -261,7 +351,13 @@ struct EPUBReaderView: View {
 
     private var topBar: some View {
         HStack(spacing: 16) {
-            Button { saveProgress(); dismiss() } label: { Image(systemName: "chevron.left") }
+            Button {
+                saveProgress()
+                Task {
+                    await saveTask?.value
+                    if model.errorMessage == nil { dismiss() }
+                }
+            } label: { Image(systemName: "chevron.left") }
                 .accessibilityLabel("返回书架")
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.book.name).font(.subheadline.weight(.semibold)).lineLimit(1)
@@ -278,7 +374,8 @@ struct EPUBReaderView: View {
                     }
                 }
                 Button("我的书签", systemImage: "bookmark.fill") { showsBookmarks = true }
-                Button("文字阅读与朗读", systemImage: "speaker.wave.2") { saveProgress(); showsTextReader = true }
+                Button("文字阅读与朗读", systemImage: "speaker.wave.2") { openTextReader(autoplay: false) }
+                    .disabled(isOpeningTextReader || model.location == nil)
             } label: { Image(systemName: "ellipsis.circle").font(.title3) }
             .accessibilityLabel("EPUB 更多")
         }.padding(.horizontal, 18).padding(.vertical, 12)
@@ -299,6 +396,10 @@ struct EPUBReaderView: View {
                     .accessibilityLabel("上一页")
                 Spacer()
                 Button("目录", systemImage: "list.bullet") { showsTOC = true }
+                Spacer()
+                Button("听书", systemImage: "headphones") { openTextReader(autoplay: true) }
+                    .disabled(isOpeningTextReader || model.location == nil)
+                    .accessibilityIdentifier("reader.epub.listen")
                 Spacer()
                 Button("排版", systemImage: "textformat.size") { showsSettings = true }
                 Spacer()
@@ -371,10 +472,41 @@ struct EPUBReaderView: View {
         }
     }
 
+    /// 等待当前位置写入后再创建听书页面，避免旧书籍快照覆盖刚读到的位置。
+    private func openTextReader(autoplay: Bool) {
+        isOpeningTextReader = true
+        saveTask?.cancel()
+        Task {
+            defer { isOpeningTextReader = false }
+            do {
+                let current = library.books.first { $0.bookUrl == model.book.bookUrl } ?? model.book
+                let book = try await model.readingBook(current, rules: replaceRules.rules)
+                await library.updateProgress(for: book, chapter: model.chapters[book.durChapterIndex],
+                    position: book.durChapterPos, epubLocation: book.readConfig!.epubLocation)
+                textReaderBook = book
+                startsListening = autoplay
+                showsTextReader = true
+            } catch { model.reportPositionError(error) }
+        }
+    }
+
+    /// 将可见正文位置和 EPUB Locator 一起保存，取消的旧页面任务不得覆盖新进度。
+    private func persistVisibleProgress() async {
+        do {
+            let current = library.books.first { $0.bookUrl == model.book.bookUrl } ?? model.book
+            let book = try await model.readingBook(current, rules: replaceRules.rules)
+            try Task.checkCancellation()
+            await library.updateProgress(for: book, chapter: model.chapters[book.durChapterIndex],
+                position: book.durChapterPos, epubLocation: book.readConfig!.epubLocation)
+        } catch is CancellationError {
+        } catch { model.reportPositionError(error) }
+    }
+
+    /// 立即提交当前画面的进度任务，返回或切换阅读方式时可等待同一个写入完成。
     private func saveProgress() {
         saveTask?.cancel()
-        guard !showsTextReader, let locator = model.location, let chapter = model.currentChapter else { return }
-        Task { await library.updateProgress(for: model.book, chapter: chapter, epubLocation: locator.jsonString) }
+        guard !showsTextReader, !isRestoringTextPosition, model.location != nil else { return }
+        saveTask = Task { await persistVisibleProgress() }
     }
 }
 

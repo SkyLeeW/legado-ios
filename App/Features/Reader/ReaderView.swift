@@ -36,6 +36,7 @@ struct ReaderView: View {
     @State private var showsContentEditor = false
     @State private var editedContent = ""
     @State private var contentEditError: String?
+    @State private var progressSaveError: String?
     @State private var backgroundImage: UIImage?
     @State private var backgroundError: String?
     @State private var showsBackgroundPicker = false
@@ -52,6 +53,10 @@ struct ReaderView: View {
     @State private var isWaitingForNextChapter = false
     @State private var isWaitingForPreviousChapter = false
     @State private var httpTTSEngines: [HttpTTS] = []
+    @State private var httpEnginesLoaded = false
+    @State private var pendingAutomaticSpeech = false
+    @State private var readerViewportSize = CGSize.zero
+    @State private var speechUsesPageUnits = false
     @State private var resumesSpeechAfterChapterLoad = false
     @State private var speechTimerTask: Task<Void, Never>?
     @State private var progressSaveTask: Task<Void, Never>?
@@ -150,8 +155,10 @@ struct ReaderView: View {
         ))
     }
 
-    init(book: Book, chapters: [BookChapter], initialIndex: Int, usesEPUBLayout: Bool = true) {
+    /// 从指定位置打开正文，听书入口可在正文、渠道和分页准备完成后自动播放一次。
+    init(book: Book, chapters: [BookChapter], initialIndex: Int, usesEPUBLayout: Bool = true, startsListening: Bool = false) {
         self.usesEPUBLayout = usesEPUBLayout
+        _pendingAutomaticSpeech = State(initialValue: startsListening)
         _pageAnimation = State(initialValue: book.readConfig?.pageAnim.flatMap { $0 >= 0 ? $0 : nil }
             ?? Self.globalPageAnimation())
         _model = StateObject(wrappedValue: ReaderViewModel(
@@ -313,6 +320,9 @@ struct ReaderView: View {
         .sheet(isPresented: $showsReaderSettings) { readerSettings }
         .sheet(isPresented: $showsClickActionSettings) { clickActionSettings }
         .sheet(isPresented: $showsContentEditor) { contentEditor }
+        .alert("保存阅读位置失败", isPresented: Binding(get: { progressSaveError != nil }, set: { if !$0 { progressSaveError = nil } })) {
+            Button("好") { progressSaveError = nil }
+        } message: { Text(progressSaveError ?? "") }
         .task(id: model.chapterLoadGeneration) {
             isWaitingForNextChapter = false
             isWaitingForPreviousChapter = false
@@ -337,9 +347,7 @@ struct ReaderView: View {
                     ? continuousPosition(model.requestedPosition, content: model.content)
                     : min(model.requestedPosition, max(model.content.utf16.count - 1, 0))
             }
-            if let chapter = model.currentChapter {
-                await library.updateProgress(for: book, chapter: chapter, position: readerPosition)
-            }
+            saveProgress(immediate: true)
             if resumesSpeechAfterChapterLoad, !model.content.isEmpty {
                 resumesSpeechAfterChapterLoad = false
                 startConfiguredSpeech()
@@ -385,6 +393,12 @@ struct ReaderView: View {
         }
         .onChange(of: ttsFollowAudio) { enabled in
             if enabled, let position = speech.currentHTTPPosition { followHTTPAudio(position) }
+        }
+        .onChange(of: readyForAutomaticSpeech) { ready in
+            if ready {
+                pendingAutomaticSpeech = false
+                toggleSpeech()
+            }
         }
         .onChange(of: readAloudByPage) { _ in
             if selectedHTTPEngine == nil { restartSpeechAfterReaderLayoutChange() }
@@ -486,6 +500,13 @@ struct ReaderView: View {
             VStack(spacing: 0) {
                 if headerVisible { readerTipBar(isHeader: true) }
                 readerSurface
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear
+                                .onAppear { readerViewportSize = geometry.size }
+                                .onChange(of: geometry.size) { readerViewportSize = $0 }
+                        }
+                    }
                 if footerVisible { readerTipBar(isHeader: false) }
             }
             .frame(maxWidth: readingColumnMaxWidth)
@@ -832,7 +853,13 @@ struct ReaderView: View {
 
     private var readerTopChrome: some View {
         HStack(spacing: 4) {
-            readerChromeIconButton("chevron.backward", label: "返回") { dismiss() }
+            readerChromeIconButton("chevron.backward", label: "返回") {
+                saveProgress(immediate: true)
+                Task {
+                    await progressSaveTask?.value
+                    if progressSaveError == nil { dismiss() }
+                }
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(book.name)
                     .font(.subheadline.weight(.medium))
@@ -926,7 +953,7 @@ struct ReaderView: View {
                     .accessibilityIdentifier("reader.changeSource")
                     .accessibilityValue(book.originName)
                 }
-                readerChromeAction(speech.isSpeaking ? "stop" : "headphones", speech.isSpeaking ? "停止" : "朗读", isActive: speech.isSpeaking) { toggleSpeech() }
+                readerChromeAction(speech.isSpeaking ? "stop" : "headphones", speech.isSpeaking ? "停止" : "听书", isActive: speech.isSpeaking) { toggleSpeech() }
                 readerChromeAction("textformat.size", "外观") {
                     showsReaderMenu = false
                     showsStyleControls = true
@@ -1697,13 +1724,17 @@ struct ReaderView: View {
 
                 if selectedHTTPEngine != nil {
                     Section {
-                        Picker("每份缓存", selection: $ttsCacheUnit) {
-                            Text("按字数").tag("characters")
-                            Text("半章").tag("halfChapter")
-                            Text("整章").tag("chapter")
-                        }
-                        if ttsCacheUnit == "characters" {
-                            Stepper("每份 \(ttsCacheCharacters) 字", value: $ttsCacheCharacters, in: 100...5000, step: 100)
+                        if selectedHTTPEngine?.mimo != nil {
+                            Text("MiMo 按阅读页缓存，播完一页后切换下一页。")
+                        } else {
+                            Picker("每份缓存", selection: $ttsCacheUnit) {
+                                Text("按字数").tag("characters")
+                                Text("半章").tag("halfChapter")
+                                Text("整章").tag("chapter")
+                            }
+                            if ttsCacheUnit == "characters" {
+                                Stepper("每份 \(ttsCacheCharacters) 字", value: $ttsCacheCharacters, in: 100...5000, step: 100)
+                            }
                         }
                         Stepper("提前缓存 \(ttsCacheAheadCount) 份", value: $ttsCacheAheadCount, in: 1...8)
                         Toggle("跟随音频翻页", isOn: $ttsFollowAudio)
@@ -2021,6 +2052,7 @@ struct ReaderView: View {
     }
 
 
+    /// 同时保存文字坐标和对应的 EPUB Locator，退出听书时原排版能恢复到同一段正文。
     private func saveProgress(immediate: Bool = false) {
         let progress = speech.httpProgress
         let chapter = progress.map { model.chapters[$0.chapterIndex] } ?? model.currentChapter
@@ -2032,7 +2064,12 @@ struct ReaderView: View {
         progressSaveTask = Task { @MainActor [weak library] in
             if !immediate { try? await Task.sleep(nanoseconds: 100_000_000) }
             guard !Task.isCancelled, let library else { return }
-            await library.updateProgress(for: currentBook, chapter: chapter, position: position)
+            do {
+                let locator = try model.epubLocation(chapter: chapter, position: position)
+                await library.updateProgress(for: currentBook, chapter: chapter, position: position, epubLocation: locator)
+            } catch {
+                progressSaveError = error.localizedDescription
+            }
         }
     }
 
@@ -2066,9 +2103,11 @@ struct ReaderView: View {
         startConfiguredSpeech()
     }
 
+    /// 按所选渠道创建连续播放计划，MiMo 使用真实阅读页作为可同步的音频边界。
     private func startConfiguredSpeech() {
         if let engine = selectedHTTPEngine {
-            // 在线播放计划基于完整章节，屏幕上的分页不再决定请求和播放器的生命周期。
+            // MiMo 没有文字时间轴，按真实阅读页合成才能在确定的音频边界切页。
+            speechUsesPageUnits = engine.mimo != nil
             speechPrefetchTask?.cancel()
             speechPrefetchTask = nil
             speechPrefetchSession = nil
@@ -2143,8 +2182,13 @@ struct ReaderView: View {
 
     /// 缓存单位始终使用原章的字符位置，半章按整章长度划分而不按当前页估算。
     private func makeHTTPUnits(index: Int, title: String, content: String, position: Int = 0) -> [ReaderHTTPSpeechUnit] {
-        ReaderHTTPSpeechUnit.make(chapterIndex: index, title: title, text: content, position: position,
-                                  mode: activeSpeechCacheUnit, characterCount: activeSpeechCacheCharacters)
+        if speechUsesPageUnits {
+            let ranges = index == model.currentIndex ? readerPageRanges
+                : readerTextConfiguration.speechPageRanges(chapter: .init(id: index, title: title, content: content), size: readerViewportSize)
+            return ReaderHTTPSpeechUnit.pages(chapterIndex: index, title: title, text: content, position: position, ranges: ranges)
+        }
+        return ReaderHTTPSpeechUnit.make(chapterIndex: index, title: title, text: content, position: position,
+                                        mode: activeSpeechCacheUnit, characterCount: activeSpeechCacheCharacters)
     }
 
     /// 串行补充足够的章节正文，取消或换书后禁止旧任务向新会话追加内容。
@@ -2187,6 +2231,10 @@ struct ReaderView: View {
             readerPosition = unit.position
             readerJumpPosition = nil
         } else {
+            if speechUsesPageUnits {
+                readerJumpPosition = unit.position
+                return
+            }
             let pageIndex = currentPage - 1
             if readerPageRanges.indices.contains(pageIndex), NSLocationInRange(unit.position, readerPageRanges[pageIndex]) { return }
             readerJumpPosition = unit.position
@@ -2279,6 +2327,12 @@ struct ReaderView: View {
         return httpTTSEngines.first { $0.id == id }
     }
 
+    /// 自动播放只等待真实的加载和布局事件，不通过延时重试猜测页面是否已经就绪。
+    private var readyForAutomaticSpeech: Bool {
+        pendingAutomaticSpeech && httpEnginesLoaded && model.hasLoadedCurrentChapter && !model.content.isEmpty
+            && !readerPageRanges.isEmpty && readerViewportSize.width > 0 && readerViewportSize.height > 0
+    }
+
     private var systemTTSVoices: [AVSpeechSynthesisVoice] {
         AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language.hasPrefix("zh") }
@@ -2295,6 +2349,7 @@ struct ReaderView: View {
         )
     }
 
+    /// 渠道读取完成后才允许听书入口自动播放，避免加载期间误用系统朗读。
     private func loadHTTPEngines() async {
         guard let database = try? LegadoDatabase(url: LegadoDatabase.defaultURL()) else { return }
         let repository = SQLiteConfigurationRepository(database: database)
@@ -2308,6 +2363,7 @@ struct ReaderView: View {
         }
         httpTTSEngines = values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         if !appTTSEngine.isEmpty, selectedHTTPEngine == nil { appTTSEngine = "" }
+        httpEnginesLoaded = true
     }
 }
 

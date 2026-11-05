@@ -26,6 +26,7 @@ public struct ChapterContentReport: Sendable {
     public var title: String?
     public var content: String
     public var supplementalContent: String?
+    public var epubTextMap: EPUBTextMap? = nil
     public var diagnostics: [RuleDiagnostic]
     public var pagesVisited: Int
 

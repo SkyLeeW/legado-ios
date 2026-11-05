@@ -35,6 +35,7 @@ final class EPUBReaderIntegrationTests: XCTestCase {
         let reader = EPUBReaderView(model: model)
             .environmentObject(library)
             .environmentObject(ReadingActivityModel.demo())
+            .environmentObject(ReplaceRuleLibraryModel.demo())
         let host = UIHostingController(rootView: reader)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         window.rootViewController = host
@@ -67,6 +68,26 @@ final class EPUBReaderIntegrationTests: XCTestCase {
             XCTAssertEqual(currentVisible.href, originalVisible.href)
             XCTAssertEqual(currentVisible.text, originalVisible.text, "菜单开关不应改变当前可见文本")
         }
+
+        // 进入听书时保留实际可见字符，返回时恢复到同章的目标段落而不是章节起点。
+        let synchronized = try await model.readingBook(report.book, rules: [])
+        XCTAssertEqual(synchronized.durChapterIndex, chapter.index)
+        XCTAssertGreaterThan(synchronized.durChapterPos, 0)
+        let raw = try XCTUnwrap(try LocalBookService().loadContent(book: report.book, chapter: chapter).epubTextMap)
+        let processed = ContentSanitizer().process(book: report.book, chapter: chapter, content: raw.text,
+                                                 rules: [], tracksSourceOffsets: true)
+        let position = (processed.content as NSString).range(of: "第55段：").location
+        XCTAssertNotEqual(position, NSNotFound)
+        var listened = synchronized
+        listened.durChapterPos = position
+        listened.readConfig?.epubLocation = try raw.processed(processed).locatorJSON(chapter: chapter, position: position)
+        await model.resumeAfterTextReading(listened)
+        XCTAssertNil(model.errorMessage)
+        try await waitForJavaScript("""
+        Array.from(document.querySelector('#paragraph55').getClientRects()).some(rect =>
+            rect.right > 0 && rect.left < window.innerWidth &&
+            rect.bottom > 0 && rect.top < window.innerHeight)
+        """, in: navigator)
     }
 
     func testOriginalCoverStylesImagesTablesAndRestoredLocation() async throws {

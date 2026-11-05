@@ -237,7 +237,7 @@ struct ReaderScrollView: UIViewRepresentable {
                 let page = min(max(Int(floor((view.contentOffset.y - start) / height)) + 1, 1), total)
                 if config.currentPage != page { config.currentPage = page }
                 if config.totalPages != total { config.totalPages = total }
-                let ranges = chapter.chapter.content.isEmpty ? [] : [NSRange(location: 0, length: chapter.chapter.content.utf16.count)]
+                let ranges = chapter.pageRanges(height: height)
                 if config.pageRanges != ranges { config.pageRanges = ranges }
                 let key = "\(anchor.chapter):\(page)"
                 if lastPageKey != key { lastPageKey = key; config.onPageChanged() }
@@ -463,8 +463,25 @@ final class ReaderScrollChapterLayout {
     let bodyStart: Int
     let left: CGFloat
     private var fragments: [(range: NSRange, top: CGFloat, height: CGFloat)] = []
+    private var paginationHeight: CGFloat = 0
+    private var cachedPageRanges: [NSRange] = []
     var blocks: [ReaderScrollBlock] {
         fragments.map { .init(chapter: self, glyphRange: $0.range, top: $0.top, height: $0.height) }
+    }
+
+    /// 将连续排版的每屏字形映射回正文，供听书切页与画面跟随共用。
+    func pageRanges(height: CGFloat) -> [NSRange] {
+        if paginationHeight == height { return cachedPageRanges }
+        paginationHeight = height
+        let bottom = blocks.last.map { $0.top + $0.height } ?? 0
+        cachedPageRanges = stride(from: CGFloat.zero, to: bottom, by: height).compactMap { top in
+            let glyphs = manager.glyphRange(forBoundingRect: CGRect(x: 0, y: top, width: container.size.width, height: height), in: container)
+            let characters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            let start = max(characters.location - bodyStart, 0)
+            let end = min(NSMaxRange(characters) - bodyStart, chapter.content.utf16.count)
+            return end > start ? NSRange(location: start, length: end - start) : nil
+        }
+        return cachedPageRanges
     }
 
     init(chapter: ReaderScrollChapter, configuration: ReaderTextView, width: CGFloat) {

@@ -58,6 +58,12 @@ final class ReaderViewModel: ObservableObject {
     @Published private(set) var scrollRetries: Set<Int> = []
     private var sourceCacheNeedsInvalidation = false
     private var pendingSourceContent: ChapterContentReport?
+    private var epubTextMaps: [Int: EPUBTextMap] = [:]
+
+    /// 将已加载章节的听书位置转成原排版 Locator，保存时同时保留两种阅读坐标。
+    func epubLocation(chapter: BookChapter, position: Int) throws -> String? {
+        try epubTextMaps[chapter.index]?.locatorJSON(chapter: chapter, position: position)
+    }
 
     func bookmarks(at position: Int, in bookmarks: [Bookmark], pageRange: NSRange? = nil) -> [Bookmark] {
         bookmarks.filter { bookmark in
@@ -308,8 +314,10 @@ final class ReaderViewModel: ObservableObject {
             book: book,
             chapter: effectiveChapter,
             content: report.content,
-            rules: usesReplaceRules ? rules : []
+            rules: usesReplaceRules ? rules : [],
+            tracksSourceOffsets: report.epubTextMap != nil
         )
+        if let map = report.epubTextMap { epubTextMaps[chapter.index] = map.processed(processed) }
         title = processed.title
         content = processed.content
         paragraphs = Self.makeParagraphs(processed.content)
@@ -400,8 +408,10 @@ final class ReaderViewModel: ObservableObject {
             book: book,
             chapter: effectiveChapter,
             content: report.content,
-            rules: usesReplaceRules ? rules : []
+            rules: usesReplaceRules ? rules : [],
+            tracksSourceOffsets: report.epubTextMap != nil
         )
+        if let map = report.epubTextMap { epubTextMaps[chapter.index] = map.processed(processed) }
         let error = (report.diagnostics + processed.diagnostics).first(where: { $0.severity == .error })?.message
             ?? (processed.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && source != nil && !chapter.isVolume
                 ? "当前书源没有返回正文。" : nil)

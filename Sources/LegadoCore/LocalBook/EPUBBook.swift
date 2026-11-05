@@ -187,15 +187,18 @@ struct EPUBBook {
         return chapters
     }
 
+    /// 提取正文时保留 DOM 位置，文字阅读和原书排版使用同一份内容来源。
     func content(chapter: BookChapter) throws -> ChapterContentReport {
         let (body, _) = try body(chapter: chapter)
-        let value = try render(body: body, from: chapter.startFragmentId, to: chapter.endFragmentId)
-        return .init(title: chapter.title, content: value.text, pagesVisited: 1)
+        let value = try EPUBTextMap(body: body, from: chapter.startFragmentId, to: chapter.endFragmentId)
+        var report = ChapterContentReport(title: chapter.title, content: value.text, pagesVisited: 1)
+        report.epubTextMap = value
+        return report
     }
 
     func illustrations(chapter: BookChapter) throws -> [EPUBIllustration] {
         let (body, path) = try body(chapter: chapter)
-        let value = try render(body: body, from: chapter.startFragmentId, to: chapter.endFragmentId)
+        let value = try EPUBTextMap(body: body, from: chapter.startFragmentId, to: chapter.endFragmentId)
         var totalBytes = 0
         return try value.images.enumerated().map { index, image in
             guard let ref = Self.resolve(image.src, relativeTo: path),
@@ -251,52 +254,6 @@ struct EPUBBook {
             }
         }
         return []
-    }
-
-    /// Walk DOM boundaries rather than slicing serialized HTML: anchors can be nested
-    /// in different parents, and all text after the end anchor belongs to the next chapter.
-    private func render(body: Element, from start: String?, to end: String?) throws -> (text: String, images: [(src: String, alt: String)]) {
-        var active = start == nil
-        var foundStart = start == nil
-        var foundEnd = end == nil
-        var finished = false
-        var output = ""
-        var images: [(src: String, alt: String)] = []
-        let blocks: Set<String> = ["p", "div", "section", "article", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "tr", "hr"]
-        func visit(_ node: Node, depth: Int) throws {
-            guard depth < 512 else { throw EPUBError.invalidPackage }
-            guard !finished else { return }
-            guard let element = node as? Element else {
-                if active, let text = node as? TextNode {
-                    output += text.getWholeText().replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-                }
-                return
-            }
-            let id = element.id()
-            let name = try element.attr("name")
-            if let end, id == end || name == end { active = false; finished = true; foundEnd = true; return }
-            if let start, id == start || name == start { active = true; foundStart = true }
-            let tag = element.tagName().lowercased()
-            let style = try element.attr("style").lowercased().replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
-            if ["script", "style", "noscript", "rt", "rp", "title"].contains(tag) || element.hasAttr("hidden") || style.contains("display:none") { return }
-            if active, blocks.contains(tag) || tag == "br" { output += "\n" }
-            if active, tag == "img" || tag == "image" {
-                var src = try element.attr(tag == "img" ? "src" : "xlink:href")
-                if src.isEmpty, tag == "image" { src = try element.attr("href") }
-                let alt = try element.attr("alt")
-                if !src.isEmpty {
-                    images.append((src, alt))
-                    output += "\n【插图 \(images.count)\(alt.isEmpty ? "" : "：" + alt)】\n"
-                }
-            }
-            for child in element.getChildNodes() { try visit(child, depth: depth + 1) }
-            if active, blocks.contains(tag) { output += "\n" }
-            if active, tag == "td" || tag == "th" { output += " " }
-        }
-        try visit(body, depth: 0)
-        guard foundStart && foundEnd else { throw EPUBError.invalidChapter }
-        let text = output.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: "\n")
-        return (text, images)
     }
 
     private func read(_ path: String) throws -> Data {

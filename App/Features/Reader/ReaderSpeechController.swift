@@ -37,6 +37,16 @@ struct ReaderHTTPSpeechUnit: Identifiable, Equatable, Sendable {
         }
         return units
     }
+
+    /// 以实际分页的起点划分连续正文，重叠的可见行只朗读一次，末页保留全部剩余文字。
+    static func pages(chapterIndex: Int, title: String, text: String, position: Int, ranges: [NSRange]) -> [Self] {
+        let source = text as NSString
+        return SpeechTextPartition.pages(text: text, position: position, visibleRanges: ranges).compactMap { range in
+            let value = source.substring(with: range)
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return .init(chapterIndex: chapterIndex, chapterTitle: title, position: range.location, text: value)
+        }
+    }
 }
 
 /// 当前音频的章节及 UTF-16 位置独立于缓存单位，词边界变化即可通知阅读页。
