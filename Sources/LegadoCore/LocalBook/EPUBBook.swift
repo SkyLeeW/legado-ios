@@ -170,7 +170,7 @@ struct EPUBBook {
             if boundaries.isEmpty {
                 boundaries = [Reference(path: item.path, fragment: nil, title: fallback)]
             } else if let first = boundaries.first, let fragment = first.fragment {
-                let prefix = try render(body: body, from: nil, to: fragment).text
+                let prefix = try EPUBTextMap(body: body, from: nil, to: fragment).text
                 if !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     boundaries.insert(Reference(path: item.path, fragment: nil, title: fallback), at: 0)
                 }

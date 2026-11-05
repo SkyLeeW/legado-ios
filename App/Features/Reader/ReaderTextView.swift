@@ -36,6 +36,7 @@ extension ReaderTextView {
         let storage = NSTextStorage()
         let manager = NSLayoutManager()
         let container = NSTextContainer(size: CGSize(width: size.width, height: .greatestFiniteMagnitude))
+        container.widthTracksTextView = true
         storage.addLayoutManager(manager)
         manager.addTextContainer(container)
         let view = UITextView(frame: CGRect(origin: .zero, size: size), textContainer: container)
