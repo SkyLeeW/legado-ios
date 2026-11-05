@@ -301,7 +301,7 @@ struct EPUBReaderView: View {
         .readingTabBarHidden()
         .task {
             model.onLocationChanged = { locator, chapter in
-                guard !showsTextReader, !isRestoringTextPosition else { return }
+                guard !showsTextReader, !isOpeningTextReader, !isRestoringTextPosition else { return }
                 if !isScrubbing { sliderProgress = locator.locations.totalProgression ?? 0 }
                 saveTask?.cancel()
                 saveTask = Task {
@@ -492,6 +492,7 @@ struct EPUBReaderView: View {
 
     /// 将可见正文位置和 EPUB Locator 一起保存，取消的旧页面任务不得覆盖新进度。
     private func persistVisibleProgress() async {
+        guard !showsTextReader, !isOpeningTextReader, !isRestoringTextPosition else { return }
         do {
             let current = library.books.first { $0.bookUrl == model.book.bookUrl } ?? model.book
             let book = try await model.readingBook(current, rules: replaceRules.rules)

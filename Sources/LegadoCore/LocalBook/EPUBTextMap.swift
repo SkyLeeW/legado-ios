@@ -31,9 +31,14 @@ public struct EPUBTextMap: Sendable {
 
         /// 取得 DOM textContent 的原始内容，作为精确文本引用的上下文。
         func rawText(_ node: Node) -> String {
-            if let node = node as? TextNode { return node.getWholeText() }
-            if let node = node as? DataNode { return node.getWholeData() }
-            return node.getChildNodes().map(rawText).joined()
+            var stack = [node]
+            var text = ""
+            while let current = stack.popLast() {
+                if let current = current as? TextNode { text += current.getWholeText() }
+                else if let current = current as? DataNode { text += current.getWholeData() }
+                else { stack.append(contentsOf: current.getChildNodes().reversed()) }
+            }
+            return text
         }
 
         /// 为每个文本节点记录稳定的元素路径，图片单独占用一个来源位置。
