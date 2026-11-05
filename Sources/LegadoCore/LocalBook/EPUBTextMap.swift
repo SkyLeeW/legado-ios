@@ -10,6 +10,12 @@ public struct EPUBTextPoint: Codable, Sendable {
 
 /// 同一份正文同时保留 DOM 来源与阅读坐标，使原排版和听书可以双向定位。
 public struct EPUBTextMap: Sendable {
+    /// 按 EPUB 声明的媒体类型解析正文，与 WebKit 保持相同的 XML 或 HTML 节点结构。
+    static func document(_ markup: String, mediaType: String) throws -> Document {
+        let xml = mediaType.hasSuffix("+xml") || mediaType == "application/xml" || mediaType == "text/xml"
+        return try SwiftSoup.parse(markup, "", xml ? Parser.xmlParser() : Parser.htmlParser())
+    }
+
     struct SourceNode: Sendable {
         let selector: String
         let childIndex: Int

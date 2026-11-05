@@ -73,8 +73,9 @@ struct EPUBTextMapTests {
     }
 
     /// XHTML 的表格不插入 HTML 专属的 tbody，元素路径与原书的 XML DOM 一致。
-    @Test func xhtmlTablePathsMatchTheOriginalDOM() throws {
-        let body = try SwiftSoup.parse(#"<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><table><tr><td>项目</td><td>数值</td></tr></table></body></html>"#).body()!
+    @Test(arguments: ["", #"<?xml version="1.0"?>"#]) func xhtmlTablePathsMatchTheOriginalDOM(declaration: String) throws {
+        let body = try EPUBTextMap.document(declaration + #"<html xmlns="http://www.w3.org/1999/xhtml"><body><table><tr><td>项目</td><td>数值</td></tr></table></body></html>"#,
+                                            mediaType: "application/xhtml+xml").body()!
         let raw = try EPUBTextMap(body: body, from: nil, to: nil)
         let json = try JSONSerialization.jsonObject(with: Data(raw.locatorJSON(chapter: resourceChapter(), position: 3).utf8)) as! [String: Any]
         #expect((json["locations"] as! [String: String])["cssSelector"] == "body > :nth-child(1) > :nth-child(1) > :nth-child(2)")

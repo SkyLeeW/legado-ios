@@ -131,7 +131,8 @@ struct EPUBBook {
         for path in paths where seen.insert(path).inserted {
             guard let data = try? read(path) else { continue }
             if let image = Self.coverThumbnail(data) { return image }
-            guard let doc = try? document(path), let images = try? doc.select("img, image").array() else { continue }
+            guard let item = manifest.first(where: { $0.path == path }),
+                  let doc = try? document(item), let images = try? doc.select("img, image").array() else { continue }
             for image in images {
                 let href = ["src", "xlink:href", "href"].compactMap { try? image.attr($0) }.first { !$0.isEmpty }
                 guard let href, let resource = Self.resolve(href, relativeTo: path),
@@ -146,7 +147,7 @@ struct EPUBBook {
         let references = navigation()
         var chapters: [BookChapter] = []
         for item in spine where !item.properties.contains("nav") {
-            let document = try document(item.path)
+            let document = try document(item)
             guard let body = document.body() else { continue }
             let elements = try body.getAllElements().array()
             var positions: [String: Int] = [:]
@@ -213,23 +214,24 @@ struct EPUBBook {
     }
 
     private func body(chapter: BookChapter) throws -> (Element, String) {
-        guard let path = chapter.resourceUrl, spine.contains(where: { $0.path == path }),
-              let body = try document(path).body() else { throw EPUBError.invalidChapter }
+        guard let path = chapter.resourceUrl, let item = spine.first(where: { $0.path == path }),
+              let body = try document(item).body() else { throw EPUBError.invalidChapter }
         return (body, path)
     }
 
-    private func document(_ path: String) throws -> Document {
-        let data = try read(path)
+    /// 使用资源声明的解析规则，避免没有 XML 声明的 XHTML 被自动插入 HTML 节点。
+    private func document(_ item: Item) throws -> Document {
+        let data = try read(item.path)
         let text: String
         if data.starts(with: [0xff, 0xfe]) || data.starts(with: [0xfe, 0xff]), let utf16 = String(data: data, encoding: .utf16) {
             text = utf16
         } else if let utf8 = String(data: data, encoding: .utf8) { text = utf8 }
         else { throw EPUBError.invalidPackage }
-        return try SwiftSoup.parse(text)
+        return try EPUBTextMap.document(text, mediaType: item.mediaType)
     }
 
     private func navigation() -> [Reference] {
-        if let nav = manifest.first(where: { $0.properties.contains("nav") }), let doc = try? document(nav.path),
+        if let nav = manifest.first(where: { $0.properties.contains("nav") }), let doc = try? document(nav),
            let nodes = try? doc.select("nav").array() {
             let toc = nodes.first { node in
                 let type = (try? node.attr("epub:type")) ?? ""
