@@ -126,7 +126,10 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
     /// 返回原排版时使用听书刚保存的正文 Locator，恢复到章内实际位置。
     func resumeAfterTextReading(_ updated: Book) async {
         do {
-            let locator = try Locator(jsonString: updated.readConfig!.epubLocation!)
+            guard let locator = try Locator(jsonString: updated.readConfig!.epubLocation!) else {
+                throw NSError(domain: "Legado.EPUBPosition", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "听书位置为空，无法恢复原排版"])
+            }
             if !(await navigator!.go(to: locator)) { errorMessage = "无法恢复听书位置" }
         } catch { errorMessage = error.localizedDescription }
     }
