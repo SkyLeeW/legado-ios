@@ -586,8 +586,7 @@ struct ReaderView: View {
                 onRetainChapters: { model.retainContinuousChapters($0) }
             )
         } else {
-            ReaderPagedView(configuration: readerTextConfiguration, chapterID: model.currentIndex,
-                            canGoPrevious: model.canGoPrevious, canGoNext: model.canGoNext)
+            readerTextConfiguration
         }
     }
 

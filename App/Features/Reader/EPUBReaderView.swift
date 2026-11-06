@@ -1,7 +1,6 @@
 import SwiftUI
 import UIKit
-// Readium 3.8 predates Swift 6 Sendable annotations; ownership stays in this
-// main-actor model and publication operations are awaited before presentation.
+// Readium 的界面和出版物操作统一由主执行器管理，等待加载完成后再呈现。
 @preconcurrency import ReadiumShared
 @preconcurrency import ReadiumStreamer
 @preconcurrency import ReadiumNavigator
@@ -78,7 +77,7 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
             )
             controller.delegate = self
             controller.view.accessibilityIdentifier = "reader.epub"
-            let adapter = DirectionalNavigationAdapter()
+            let adapter = DirectionalNavigationAdapter(animatedTransition: true)
             adapter.bind(to: controller)
             navigationAdapter = adapter
             // 边缘翻页先消费点击，剩余的中央点击只切换菜单，不再经过旧委托回调。
@@ -121,6 +120,14 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
     func go(toProgress progress: Double) async {
         guard let navigator, let locator = await navigator.publication.locate(progression: progress) else { return }
         _ = await navigator.go(to: locator)
+    }
+
+    /// 底部按钮和屏幕边缘使用相同的 Readium 动画导航，跨章由引擎保留首尾页位置。
+    func turnPage(forward: Bool) async {
+        guard let navigator else { return }
+        let options = NavigatorGoOptions(animated: true)
+        if forward { _ = await navigator.goForward(options: options) }
+        else { _ = await navigator.goBackward(options: options) }
     }
 
     /// 返回原排版时使用听书刚保存的正文 Locator，恢复到章内实际位置。
@@ -372,8 +379,11 @@ struct EPUBReaderView: View {
                 Button("添加书签", systemImage: "bookmark") {
                     guard let locator = model.location, let chapter = model.currentChapter else { return }
                     Task {
-                        await activity.addBookmark(book: model.book, chapter: chapter, position: 0,
-                                                   content: locator.text.highlight ?? chapter.title, epubLocation: locator.jsonString)
+                        do {
+                            let json = try locator.jsonString()
+                            await activity.addBookmark(book: model.book, chapter: chapter, position: 0,
+                                                       content: locator.text.highlight ?? chapter.title, epubLocation: json)
+                        } catch { model.reportPositionError(error) }
                     }
                 }
                 Button("我的书签", systemImage: "bookmark.fill") { showsBookmarks = true }
@@ -395,7 +405,7 @@ struct EPUBReaderView: View {
                     .font(.caption.monospacedDigit()).frame(width: 42)
             }
             HStack {
-                Button { Task { _ = await model.navigator?.goBackward() } } label: { Image(systemName: "chevron.left") }
+                Button { Task { await model.turnPage(forward: false) } } label: { Image(systemName: "chevron.left") }
                     .accessibilityLabel("上一页")
                 Spacer()
                 Button("目录", systemImage: "list.bullet") { showsTOC = true }
@@ -406,7 +416,7 @@ struct EPUBReaderView: View {
                 Spacer()
                 Button("排版", systemImage: "textformat.size") { showsSettings = true }
                 Spacer()
-                Button { Task { _ = await model.navigator?.goForward() } } label: { Image(systemName: "chevron.right") }
+                Button { Task { await model.turnPage(forward: true) } } label: { Image(systemName: "chevron.right") }
                     .accessibilityLabel("下一页")
             }.font(.subheadline)
         }.padding(.horizontal, 20).padding(.vertical, 12)
