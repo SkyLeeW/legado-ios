@@ -1,6 +1,300 @@
 import SwiftUI
 import UIKit
 
+/// 每页使用独立的有限高度 TextKit 容器，跨页段落由同一排版器连续布局。
+@MainActor
+final class ReaderPagedChapterLayout {
+    let storage: NSTextStorage
+    let manager = NSLayoutManager()
+    let text: String
+    let title: String
+    let origin: CGPoint
+    private(set) var ranges: [NSRange] = []
+    private(set) var glyphRanges: [NSRange] = []
+    private(set) var errorMessage: String?
+
+    /// 按实际可用视口排出完整行，标题占用第一页空间，正文范围保持连续且不重叠。
+    init(text: String, title: String, configuration: ReaderTextView, size: CGSize) {
+        self.text = text
+        self.title = title
+        origin = CGPoint(x: configuration.paddingLeft, y: configuration.paddingTop + configuration.headerInset)
+        let typography = ReaderTypography(configuration: configuration)
+        let rendered = NSMutableAttributedString(string: "")
+        if configuration.titleMode != 2 || configuration.isVolume, !title.isEmpty {
+            rendered.append(NSAttributedString(string: title + "\n", attributes: typography.headingAttributes))
+        }
+        let prefix = rendered.length
+        rendered.append(NSAttributedString(string: text, attributes: typography.bodyAttributes))
+        storage = NSTextStorage(attributedString: rendered)
+        storage.addLayoutManager(manager)
+        let containerSize = CGSize(
+            width: size.width - CGFloat(configuration.paddingLeft + configuration.paddingRight),
+            height: size.height - CGFloat(configuration.paddingTop + configuration.headerInset
+                + configuration.paddingBottom + configuration.footerInset)
+        )
+        guard containerSize.width > 8, containerSize.height > 0 else {
+            errorMessage = "页面没有可用的正文空间，请减小页边距。"
+            return
+        }
+        var consumed = 0
+        while consumed < manager.numberOfGlyphs {
+            let container = NSTextContainer(size: containerSize)
+            container.lineFragmentPadding = 4
+            container.lineBreakMode = .byWordWrapping
+            manager.addTextContainer(container)
+            manager.ensureLayout(for: container)
+            let glyphs = manager.glyphRange(for: container)
+            guard glyphs.length > 0 else {
+                errorMessage = "当前页面无法容纳一整行文字，请减小字号或页边距。"
+                return
+            }
+            let characters = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            let start = max(characters.location - prefix, 0)
+            let end = min(max(NSMaxRange(characters) - prefix, 0), text.utf16.count)
+            ranges.append(NSRange(location: start, length: end - start))
+            glyphRanges.append(glyphs)
+            consumed = NSMaxRange(glyphs)
+        }
+    }
+
+    /// 章节开头固定返回第一页，其余位置定位到包含该正文字符的页面。
+    func page(containing position: Int) -> Int {
+        if position == 0 { return 0 }
+        return ranges.firstIndex(where: { NSLocationInRange(position, $0) }) ?? max(ranges.count - 1, 0)
+    }
+}
+
+/// 分页画布只绘制当前容器中的字形，不从长滚动视图截取半行文字。
+@MainActor
+final class ReaderPagedCanvas: UIView {
+    var layout: ReaderPagedChapterLayout?
+    var pageIndex = 0
+    var viewportChanged: (() -> Void)?
+    private var previousSize = CGSize.zero
+
+    /// 设置静态文字的无障碍语义，并在翻页和视口变化时重新绘制。
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isAccessibilityElement = true
+        accessibilityTraits = .staticText
+        accessibilityIdentifier = "reader.text"
+        contentMode = .redraw
+        clipsToBounds = true
+    }
+
+    /// 阅读画布由代码创建，不使用归档初始化。
+    required init?(coder: NSCoder) { fatalError("阅读画布不支持归档初始化") }
+
+    /// 仅在真实视口大小变化时请求重新分页，菜单状态变化不会重排正文。
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if previousSize != bounds.size {
+            previousSize = bounds.size
+            viewportChanged?()
+        }
+    }
+
+    /// 当前页字形使用所属容器的坐标绘制，行高和段落间距由 TextKit 统一处理。
+    override func draw(_ rect: CGRect) {
+        guard let layout else { return }
+        if let message = layout.errorMessage {
+            (message as NSString).draw(in: bounds.insetBy(dx: 20, dy: 20), withAttributes: [
+                .font: UIFont.preferredFont(forTextStyle: .body), .foregroundColor: UIColor.label
+            ])
+            return
+        }
+        guard layout.glyphRanges.indices.contains(pageIndex) else { return }
+        let glyphs = layout.glyphRanges[pageIndex]
+        layout.manager.drawBackground(forGlyphRange: glyphs, at: layout.origin)
+        layout.manager.drawGlyphs(forGlyphRange: glyphs, at: layout.origin)
+    }
+}
+
+/// 翻页、恢复进度和逐页听书共用同一份真实分页结果。
+struct ReaderPagedView: UIViewRepresentable {
+    let configuration: ReaderTextView
+    let chapterID: Int
+    let canGoPrevious: Bool
+    let canGoNext: Bool
+
+    /// 协调器持有当前页和章节状态，避免 SwiftUI 更新再次消费跨章手势。
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    /// 创建独立分页画布并安装一次点击、左右滑动与自动阅读时钟。
+    func makeUIView(context: Context) -> ReaderPagedCanvas { context.coordinator.makeView() }
+
+    /// 配置变化仅在排版或正文实际改变时重排，普通菜单更新保留当前页。
+    func updateUIView(_ view: ReaderPagedCanvas, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.update(view)
+    }
+
+    /// 离开阅读页后释放时钟及视口回调。
+    static func dismantleUIView(_ view: ReaderPagedCanvas, coordinator: Coordinator) {
+        coordinator.displayLink?.invalidate()
+        view.viewportChanged = nil
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var parent: ReaderPagedView
+        var displayLink: CADisplayLink?
+        private weak var view: ReaderPagedCanvas?
+        private var chapterID: Int?
+        private var styleKey = ""
+        private var viewport = CGSize.zero
+        private var lastJump: Int?
+        private var waitingForChapter = false
+        private var turning = false
+        private var revision = 0
+        private var timestamp: CFTimeInterval = 0
+        private var elapsed: CFTimeInterval = 0
+
+        /// 绑定配置快照，章节加载前后由显式章节标识区分。
+        init(parent: ReaderPagedView) { self.parent = parent }
+
+        /// 安装自定义翻页手势，避免 UIScrollView 原生分页再次吸附到另一页。
+        func makeView() -> ReaderPagedCanvas {
+            let canvas = ReaderPagedCanvas(frame: .zero)
+            view = canvas
+            canvas.viewportChanged = { [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                self.update(canvas)
+            }
+            canvas.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+            for direction: UISwipeGestureRecognizer.Direction in [.left, .right] {
+                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(swiped(_:)))
+                swipe.direction = direction
+                canvas.addGestureRecognizer(swipe)
+            }
+            let link = CADisplayLink(target: self, selector: #selector(step(_:)))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+            return canvas
+        }
+
+        /// 新章按请求位置恢复，重排保留当前正文锚点，只有明确跳转才改变所选页面。
+        func update(_ view: ReaderPagedCanvas) {
+            let config = parent.configuration
+            view.backgroundColor = config.backgroundColor
+            guard view.bounds.width > 0, view.bounds.height > 0 else { return }
+            let newChapter = chapterID != parent.chapterID
+            let key = config.scrollTypographyKey + "|\(config.isVolume)|\(config.headerInset)|\(config.footerInset)"
+            let changed = newChapter || styleKey != key || viewport != view.bounds.size
+                || view.layout?.text != config.text || view.layout?.title != config.title
+            if changed {
+                let anchor = newChapter || view.layout?.text.isEmpty != false
+                    ? config.requestedPosition : config.readerPosition
+                revision += 1
+                view.layer.removeAllAnimations()
+                turning = false
+                if newChapter { waitingForChapter = false; lastJump = nil }
+                chapterID = parent.chapterID
+                styleKey = key
+                viewport = view.bounds.size
+                let layout = ReaderPagedChapterLayout(text: config.text, title: config.title, configuration: config, size: view.bounds.size)
+                view.layout = layout
+                view.pageIndex = layout.page(containing: anchor)
+                elapsed = 0
+            }
+            if let position = config.jumpPosition, position != lastJump {
+                lastJump = position
+                view.pageIndex = view.layout!.page(containing: position)
+                elapsed = 0
+            } else if config.jumpPosition == nil { lastJump = nil }
+            refresh(view)
+        }
+
+        /// 回传捕获时的页码和范围，异步旧章节回调不能覆盖新章第一页的进度。
+        private func refresh(_ view: ReaderPagedCanvas) {
+            view.setNeedsDisplay()
+            let layout = view.layout!
+            guard layout.ranges.indices.contains(view.pageIndex) else { return }
+            let characters = layout.manager.characterRange(forGlyphRange: layout.glyphRanges[view.pageIndex], actualGlyphRange: nil)
+            view.accessibilityLabel = (layout.storage.string as NSString).substring(with: characters)
+            let config = parent.configuration
+            let page = view.pageIndex
+            let position = layout.ranges[page].location
+            let generation = revision
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self, let view, self.revision == generation, view.pageIndex == page else { return }
+                let moved = config.currentPage != page + 1 || config.readerPosition != position
+                if config.currentPage != page + 1 { config.currentPage = page + 1 }
+                if config.totalPages != layout.ranges.count { config.totalPages = layout.ranges.count }
+                if config.pageRanges != layout.ranges { config.pageRanges = layout.ranges }
+                if config.readerPosition != position { config.readerPosition = position }
+                if moved { config.onPageChanged() }
+            }
+        }
+
+        /// 一次翻页只消费一个页索引，跨章期间等待新正文，不重复执行同一个手势。
+        private func turn(_ direction: Int) {
+            guard !turning, !waitingForChapter, let view, let layout = view.layout,
+                  !parent.configuration.text.isEmpty, layout.errorMessage == nil else { return }
+            elapsed = 0
+            let target = view.pageIndex + direction
+            if target < 0 || target >= layout.ranges.count {
+                waitingForChapter = direction < 0 ? parent.canGoPrevious : parent.canGoNext
+                if direction < 0 { parent.configuration.onReachedStart(layout.ranges[view.pageIndex].location) }
+                else { parent.configuration.onReachedEnd(parent.configuration.text.utf16.count) }
+                return
+            }
+            let config = parent.configuration
+            let mode = config.isEInkMode ? 4 : config.pageAnimation
+            let generation = revision
+            view.pageIndex = target
+            turning = mode != 4
+            let finish: (Bool) -> Void = { [weak self] _ in
+                guard let self, self.revision == generation else { return }
+                self.turning = false
+            }
+            if mode == 2 {
+                UIView.transition(with: view, duration: 0.38, options: direction > 0 ? .transitionCurlUp : .transitionCurlDown,
+                                  animations: { self.refresh(view) }, completion: finish)
+            } else {
+                if mode != 4 {
+                    let animation = CATransition()
+                    animation.duration = 0.3
+                    animation.type = mode == 0 ? (direction > 0 ? .reveal : .moveIn) : .push
+                    animation.subtype = direction > 0 ? .fromRight : .fromLeft
+                    view.layer.add(animation, forKey: "reader-page")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { finish(true) }
+                }
+                refresh(view)
+            }
+        }
+
+        /// 点击区域只产生一次动作，屏幕中央固定切换菜单。
+        @objc private func tapped(_ gesture: UITapGestureRecognizer) {
+            guard let view, gesture.state == .ended else { return }
+            let point = gesture.location(in: view)
+            let column = min(max(Int(point.x / (view.bounds.width / 3)), 0), 2)
+            let row = min(max(Int(point.y / (view.bounds.height / 3)), 0), 2)
+            let index = row * 3 + column
+            let action = index == 4 ? 0 : parent.configuration.clickActions[index]
+            switch action {
+            case 1: turn(1)
+            case 2: turn(-1)
+            case -1: break
+            default: parent.configuration.onTapAction(action)
+            }
+        }
+
+        /// 左右滑动与点击共用同一个页索引状态机。
+        @objc private func swiped(_ gesture: UISwipeGestureRecognizer) { turn(gesture.direction == .left ? 1 : -1) }
+
+        /// 自动阅读到期后按同一分页结果前进，不再对正文执行固定像素滚动。
+        @objc private func step(_ link: CADisplayLink) {
+            defer { timestamp = link.timestamp }
+            let config = parent.configuration
+            guard config.isAutoReading, !config.isAutoReadPaused, !turning, !waitingForChapter else { elapsed = 0; return }
+            guard timestamp > 0 else { return }
+            elapsed += link.timestamp - timestamp
+            if elapsed >= config.secondsPerScreen { turn(1) }
+        }
+    }
+}
+
 /// 屏幕分页和听书预排共同使用 TextKit 的真实字形范围，避免按字数估算页边界。
 @MainActor
 enum ReaderPageLayout {
@@ -33,32 +327,7 @@ extension ReaderTextView {
             return ReaderScrollChapterLayout(chapter: chapter, configuration: self, width: size.width)
                 .pageRanges(height: size.height)
         }
-        let storage = NSTextStorage()
-        let manager = NSLayoutManager()
-        let container = NSTextContainer(size: CGSize(width: size.width, height: .greatestFiniteMagnitude))
-        container.widthTracksTextView = true
-        storage.addLayoutManager(manager)
-        manager.addTextContainer(container)
-        let view = UITextView(frame: CGRect(origin: .zero, size: size), textContainer: container)
-        view.contentInsetAdjustmentBehavior = .never
-        view.textContainer.lineFragmentPadding = 4
-        view.textContainerInset = .init(top: paddingTop + headerInset, left: paddingLeft,
-                                       bottom: paddingBottom + footerInset, right: paddingRight)
-        let typography = ReaderTypography(configuration: self)
-        let rendered = NSMutableAttributedString(string: "")
-        if titleMode != 2 || isVolume, !chapter.title.isEmpty {
-            rendered.append(NSAttributedString(string: chapter.title + "\n", attributes: typography.headingAttributes))
-        }
-        let prefix = rendered.length
-        rendered.append(NSAttributedString(string: chapter.content, attributes: typography.bodyAttributes))
-        view.attributedText = rendered
-        view.layoutManager.ensureLayout(for: view.textContainer)
-        view.layoutIfNeeded()
-        let height = max(size.height - view.textContainerInset.top - view.textContainerInset.bottom, 1)
-        let maximum = max(view.contentSize.height - size.height, 0)
-        return ReaderPageLayout.ranges(in: view, prefix: prefix, bodyLength: chapter.content.utf16.count,
-                                     pageHeight: height, minimum: 0, maximum: maximum,
-                                     total: Int(ceil(maximum / height)) + 1)
+        return ReaderPagedChapterLayout(text: chapter.content, title: chapter.title, configuration: self, size: size).ranges
     }
 }
 
