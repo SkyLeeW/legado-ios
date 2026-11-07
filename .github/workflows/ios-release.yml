@@ -1,6 +1,8 @@
 name: iOS 编译打包与发布
 
 on:
+  # 支持手动构建指定分支，使用与推送发布相同的验证和打包步骤。
+  workflow_dispatch:
   push:
     branches: [dev]
     tags: ['v*']
