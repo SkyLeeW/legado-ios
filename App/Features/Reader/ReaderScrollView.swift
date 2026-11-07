@@ -14,12 +14,17 @@ struct ReaderScrollView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
+    /// 连续阅读的原生容器使用阅读主题，避免受应用窗口的明暗设置影响。
     func makeUIView(context: Context) -> ReaderScrollCollectionView {
-        context.coordinator.makeView()
+        let view = context.coordinator.makeView()
+        view.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
+        return view
     }
 
+    /// 阅读主题改变时同时更新滚动容器外观和正文排版。
     func updateUIView(_ view: ReaderScrollCollectionView, context: Context) {
         context.coordinator.parent = self
+        view.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
         context.coordinator.update(view)
     }
 

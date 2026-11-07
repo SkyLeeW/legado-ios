@@ -115,7 +115,7 @@ final class EPUBReaderIntegrationTests: XCTestCase {
         let locator = try XCTUnwrap(model.location)
         XCTAssertEqual(EPUBReaderModel.path(locator.href.string), "Text/chapter.xhtml")
         var saved = report.book
-        saved.readConfig?.epubLocation = locator.jsonString
+        saved.readConfig?.epubLocation = try locator.jsonString()
         saved.durChapterIndex = try XCTUnwrap(model.currentChapter).index
         let restored = EPUBReaderModel(book: saved, chapters: report.chapters, initialIndex: saved.durChapterIndex)
         await restored.open(preferences: .init(fontSize: 1.4, publisherStyles: true))

@@ -5,6 +5,16 @@ import UIKit
 @preconcurrency import ReadiumStreamer
 @preconcurrency import ReadiumNavigator
 
+extension ReaderStylePreset {
+    /// 通过 Readium 正式的配色偏好设置正文颜色，原书排版与普通正文使用相同色值。
+    func epubPreferences(fontScale: Double, publisherStyles: Bool, scroll: Bool) -> EPUBPreferences {
+        EPUBPreferences(backgroundColor: ReadiumNavigator.Color(uiColor: background), fontSize: fontScale,
+                        publisherStyles: publisherStyles, scroll: scroll,
+                        textColor: ReadiumNavigator.Color(uiColor: foreground),
+                        theme: colorScheme == .dark ? .dark : .light)
+    }
+}
+
 /// EPUB keeps its XHTML, CSS, SVG, images and navigation in Readium. The text
 /// reader remains available for the app's existing speech and text tools.
 @MainActor
@@ -245,7 +255,6 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
 struct EPUBReaderView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var library: BookLibraryModel
     @EnvironmentObject private var activity: ReadingActivityModel
     @EnvironmentObject private var replaceRules: ReplaceRuleLibraryModel
@@ -264,7 +273,8 @@ struct EPUBReaderView: View {
     @AppStorage("epubFontScale") private var fontScale = 1.0
     @AppStorage("epubScroll") private var scroll = false
     @AppStorage("epubPublisherStyles") private var publisherStyles = true
-    @AppStorage("epubTheme") private var theme = "system"
+    @AppStorage("readerTheme") private var theme = "wechat"
+    @AppStorage("themeMode") private var themeMode = "0"
 
     /// 使用书籍信息创建原排版阅读模型。
     init(book: Book, chapters: [BookChapter], initialIndex: Int) {
@@ -277,8 +287,12 @@ struct EPUBReaderView: View {
     }
 
     private var preferences: EPUBPreferences {
-        EPUBPreferences(fontSize: fontScale, publisherStyles: publisherStyles, scroll: scroll,
-                        theme: theme == "sepia" ? .sepia : (theme == "dark" || (theme == "system" && colorScheme == .dark) ? .dark : .light))
+        resolvedStyle.epubPreferences(fontScale: fontScale, publisherStyles: publisherStyles, scroll: scroll)
+    }
+
+    /// EPUB 和听书文字页读取同一个阅读主题，应用明暗仅影响阅读器以外的页面。
+    private var resolvedStyle: ReaderStylePreset {
+        ReaderStylePreset.resolve(theme, themeMode: themeMode)
     }
 
     var body: some View {
@@ -299,14 +313,15 @@ struct EPUBReaderView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // 工具栏叠加在正文上，不改变视口尺寸，避免开关菜单时触发 EPUB 重新分页。
         .overlay(alignment: .top) {
-            if model.showsControls { topBar.background(Color(uiColor: .systemBackground)) }
+            if model.showsControls { topBar.background(Color(uiColor: resolvedStyle.background)) }
         }
         .overlay(alignment: .bottom) {
             if model.showsControls, model.navigator != nil {
-                bottomBar.background(Color(uiColor: .systemBackground))
+                bottomBar.background(Color(uiColor: resolvedStyle.background))
             }
         }
-        .background(Color(uiColor: .systemBackground))
+        .background(Color(uiColor: resolvedStyle.background).ignoresSafeArea())
+        .foregroundStyle(Color(uiColor: resolvedStyle.foreground))
         .navigationBarHidden(true)
         .readingTabBarHidden()
         .task {
@@ -334,9 +349,9 @@ struct EPUBReaderView: View {
                 Task { await activity.endReading(model.book) }
             }
         }
-        .sheet(isPresented: $showsTOC) { tocSheet }
-        .sheet(isPresented: $showsSettings) { settingsSheet }
-        .sheet(isPresented: $showsBookmarks) { bookmarksSheet }
+        .sheet(isPresented: $showsTOC) { tocSheet.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsSettings) { settingsSheet.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsBookmarks) { bookmarksSheet.readerSheetAppearance(resolvedStyle) }
         .fullScreenCover(isPresented: $showsTextReader, onDismiss: {
             if let book = library.books.first(where: { $0.bookUrl == model.book.bookUrl }) {
                 isRestoringTextPosition = true
@@ -353,10 +368,12 @@ struct EPUBReaderView: View {
                                usesEPUBLayout: false, startsListening: startsListening)
                 }
             }
+            .readerSheetAppearance(resolvedStyle)
         }
         .alert("EPUB 阅读", isPresented: Binding(get: { model.navigator != nil && model.errorMessage != nil }, set: { if !$0 { model.clearError() } })) {
             Button("好") { model.clearError() }
         } message: { Text(model.errorMessage ?? "") }
+        .readerAppearance(resolvedStyle)
     }
 
     private var topBar: some View {
@@ -451,11 +468,11 @@ struct EPUBReaderView: View {
                 }
                 Section("背景") {
                     Picker("主题", selection: $theme) {
-                        Text("跟随系统").tag("system")
-                        Text("白色").tag("light")
-                        Text("纸色").tag("sepia")
-                        Text("夜间").tag("dark")
+                        ForEach(ReaderStylePreset.legadoDefaults) { preset in
+                            Text(preset.name).tag(preset.id)
+                        }
                     }
+                    .disabled(themeMode == "3")
                 }
             }
             .navigationTitle("EPUB 排版").navigationBarTitleDisplayMode(.inline)
@@ -526,6 +543,14 @@ struct EPUBReaderView: View {
 
 private struct EPUBNavigatorHost: UIViewControllerRepresentable {
     let navigator: EPUBNavigatorViewController
-    func makeUIViewController(context: Context) -> EPUBNavigatorViewController { navigator }
-    func updateUIViewController(_ controller: EPUBNavigatorViewController, context: Context) {}
+    /// 原生导航控制器使用阅读页面的明暗环境，不继承书架所在窗口的外观。
+    func makeUIViewController(context: Context) -> EPUBNavigatorViewController {
+        navigator.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
+        return navigator
+    }
+
+    /// 切换阅读主题时同步原生控件外观，正文配色由 Readium 偏好设置负责更新。
+    func updateUIViewController(_ controller: EPUBNavigatorViewController, context: Context) {
+        controller.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
+    }
 }

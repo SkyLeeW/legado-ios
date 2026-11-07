@@ -134,6 +134,7 @@ struct ReaderTextView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
+    /// 创建原生正文视图时使用阅读界面的明暗环境，避免原生控件继承应用的相反外观。
     func makeUIView(context: Context) -> UITextView {
         // Pagination uses NSLayoutManager. Start in TextKit 1 rather than
         // switching a TextKit 2 view after its content size has been computed.
@@ -148,6 +149,7 @@ struct ReaderTextView: UIViewRepresentable {
             coordinator?.reportPageRanges(in: view)
         }
         view.accessibilityIdentifier = "reader.text"
+        view.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
         let effectivePageAnimation = isEInkMode ? 4 : pageAnimation
         view.backgroundColor = backgroundColor
         view.isOpaque = backgroundColor != .clear
@@ -167,8 +169,10 @@ struct ReaderTextView: UIViewRepresentable {
         return view
     }
 
+    /// 正文排版更新与阅读主题同步，原生视图和 SwiftUI 菜单始终采用相同明暗。
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.parent = self
+        view.overrideUserInterfaceStyle = context.environment.colorScheme == .dark ? .dark : .light
         let viewportSizeChanged = view.bounds.size != .zero
             && context.coordinator.lastViewportSize != view.bounds.size
         if viewportSizeChanged {

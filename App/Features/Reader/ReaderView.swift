@@ -213,7 +213,6 @@ struct ReaderView: View {
 
     private var textReaderBody: some View {
         readerCanvas
-        .preferredColorScheme(resolvedStyle.id == "night" ? .dark : .light)
         .readingTabBarHidden()
         .navigationBarBackButtonHidden(true)
         .background {
@@ -289,14 +288,15 @@ struct ReaderView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .sheet(isPresented: $showsTableOfContents) { tableOfContents }
-        .sheet(isPresented: $showsBookmarks) { bookmarksSheet }
+        .sheet(isPresented: $showsTableOfContents) { tableOfContents.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsBookmarks) { bookmarksSheet.readerSheetAppearance(resolvedStyle) }
         .sheet(item: $illustrationChapter) { chapter in
             EPUBIllustrationsView(book: book, chapter: chapter)
+                .readerSheetAppearance(resolvedStyle)
         }
-        .sheet(isPresented: $showsAutoReadControls) { autoReadControls }
-        .sheet(isPresented: $showsStyleControls) { styleControls }
-        .sheet(isPresented: $showsContentSearch) { contentSearchSheet }
+        .sheet(isPresented: $showsAutoReadControls) { autoReadControls.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsStyleControls) { styleControls.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsContentSearch) { contentSearchSheet.readerSheetAppearance(resolvedStyle) }
         .sheet(item: $sourceSwitchBook) { currentBook in
             ReadingNavigationStack {
                 SourceSwitchView(book: currentBook, sources: sourceLibrary.sources) { report, source in
@@ -313,13 +313,15 @@ struct ReaderView: View {
                     }
                 }
             }
+            .readerSheetAppearance(resolvedStyle)
         }
         .sheet(isPresented: $showsReplaceRules) {
             ReadingNavigationStack { ReplaceRuleManagementView() }
+                .readerSheetAppearance(resolvedStyle)
         }
-        .sheet(isPresented: $showsReaderSettings) { readerSettings }
-        .sheet(isPresented: $showsClickActionSettings) { clickActionSettings }
-        .sheet(isPresented: $showsContentEditor) { contentEditor }
+        .sheet(isPresented: $showsReaderSettings) { readerSettings.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsClickActionSettings) { clickActionSettings.readerSheetAppearance(resolvedStyle) }
+        .sheet(isPresented: $showsContentEditor) { contentEditor.readerSheetAppearance(resolvedStyle) }
         .alert("保存阅读位置失败", isPresented: Binding(get: { progressSaveError != nil }, set: { if !$0 { progressSaveError = nil } })) {
             Button("好") { progressSaveError = nil }
         } message: { Text(progressSaveError ?? "") }
@@ -440,6 +442,7 @@ struct ReaderView: View {
             let updatedBook = model.useGlobalPageAnimation()
             Task { await library.addOrUpdate(updatedBook) }
         }
+        .readerAppearance(resolvedStyle)
     }
 
 
@@ -738,7 +741,7 @@ struct ReaderView: View {
     }
 
     private var resolvedStyle: ReaderStylePreset {
-        themeMode == "3" ? .eInk : ReaderStylePreset.resolve(theme)
+        ReaderStylePreset.resolve(theme, themeMode: themeMode)
     }
 
     private var headerVisible: Bool {
@@ -827,16 +830,10 @@ struct ReaderView: View {
     }
 
     private var readerChromeTint: Color {
-        .primary
+        foregroundColor
     }
 
-    @ViewBuilder private var readerChromeBackground: some View {
-        if resolvedStyle.id == "night" {
-            Color(uiColor: .secondarySystemBackground)
-        } else {
-            Color(uiColor: .systemBackground)
-        }
-    }
+    private var readerChromeBackground: Color { backgroundColor }
 
     private var chapterProgress: Double {
         let chapter = max(model.chapters.filter { !$0.isVolume }.count, 1)

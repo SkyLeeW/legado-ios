@@ -16,6 +16,9 @@ struct ReaderStylePreset: Identifiable {
     let background: UIColor
     let foreground: UIColor
 
+    /// 阅读界面的明暗由所选阅读主题决定，与书架等页面的应用外观分别控制。
+    var colorScheme: ColorScheme { id == "night" ? .dark : .light }
+
     static let legadoDefaults: [ReaderStylePreset] = [
         .init(id: "wechat", name: "微信读书", background: UIColor(hex: 0xC0EDC6), foreground: UIColor(hex: 0x0B0B0B)),
         .init(id: "preset1", name: "预设1", background: UIColor(hex: 0xFFFFFF), foreground: UIColor(hex: 0x000000)),
@@ -40,6 +43,23 @@ struct ReaderStylePreset: Identifiable {
         default: id
         }
         return legadoDefaults.first(where: { $0.id == migratedID }) ?? legadoDefaults[0]
+    }
+
+    /// 普通正文和 EPUB 共用同一套主题解析，墨水屏模式统一使用黑字白底。
+    static func resolve(_ id: String, themeMode: String) -> ReaderStylePreset {
+        themeMode == "3" ? .eInk : resolve(id)
+    }
+}
+
+extension View {
+    /// 在当前阅读页面内设置明暗环境，避免向上覆盖应用外观或被应用外观覆盖。
+    func readerAppearance(_ style: ReaderStylePreset) -> some View {
+        environment(\.colorScheme, style.colorScheme)
+    }
+
+    /// 阅读弹窗拥有独立的呈现容器，其原生控件和内容同时使用当前阅读主题。
+    func readerSheetAppearance(_ style: ReaderStylePreset) -> some View {
+        readerAppearance(style).preferredColorScheme(style.colorScheme)
     }
 }
 
