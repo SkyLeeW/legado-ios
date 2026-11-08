@@ -133,6 +133,7 @@
 		EE1000000000000000000001 /* EPUBTextMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2000000000000000000001; };
 		EE1000000000000000000002 /* TextSourceMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2000000000000000000002; };
 		EE1000000000000000000003 /* SpeechTextPartition.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2000000000000000000003; };
+		EE1000000000000000000004 /* SpeechInterruptionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2000000000000000000004; };
 		EB1000000000000000000002 /* ZIPFoundation-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = EB2000000000000000000002; };
 		EB1000000000000000000003 /* EPUBIllustrationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB2000000000000000000003; };
         F10000000000000000000004 /* ReadiumShared in Frameworks */ = {isa = PBXBuildFile; productRef = F20000000000000000000004; };
@@ -272,6 +273,7 @@
 		EE2000000000000000000001 /* EPUBTextMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LegadoCore/LocalBook/EPUBTextMap.swift; sourceTree = SOURCE_ROOT; };
 		EE2000000000000000000002 /* TextSourceMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LegadoCore/Book/TextSourceMap.swift; sourceTree = SOURCE_ROOT; };
 		EE2000000000000000000003 /* SpeechTextPartition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LegadoCore/TTS/SpeechTextPartition.swift; sourceTree = SOURCE_ROOT; };
+		EE2000000000000000000004 /* SpeechInterruptionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LegadoCore/TTS/SpeechInterruptionState.swift; sourceTree = SOURCE_ROOT; };
 		EB2000000000000000000002 /* ZIPFoundation-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = App/Resources/ZIPFoundation-LICENSE.txt; sourceTree = SOURCE_ROOT; };
 		EB2000000000000000000003 /* EPUBIllustrationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Features/Reader/EPUBIllustrationsView.swift; sourceTree = SOURCE_ROOT; };
         ED2000000000000000000001 /* EPUBReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EPUBReaderView.swift; sourceTree = "<group>"; };
@@ -570,6 +572,7 @@
 				EE2000000000000000000001 /* EPUBTextMap.swift */,
 				EE2000000000000000000002 /* TextSourceMap.swift */,
 				EE2000000000000000000003 /* SpeechTextPartition.swift */,
+				EE2000000000000000000004 /* SpeechInterruptionState.swift */,
 			);
 			path = LocalBook;
 			sourceTree = "<group>";
@@ -834,6 +837,7 @@
 				EE1000000000000000000001 /* EPUBTextMap.swift in Sources */,
 				EE1000000000000000000002 /* TextSourceMap.swift in Sources */,
 				EE1000000000000000000003 /* SpeechTextPartition.swift in Sources */,
+				EE1000000000000000000004 /* SpeechInterruptionState.swift in Sources */,
 				C10000000000000000000019 /* ContentSanitizer.swift in Sources */,
 				C1000000000000000000001A /* ReplaceRuleRepository.swift in Sources */,
 				C1000000000000000000001B /* ReadingActivityRepository.swift in Sources */,
@@ -937,7 +941,7 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.1.22;
+				MARKETING_VERSION = 0.1.23;
 				OTHER_LDFLAGS = "$(inherited) -lsqlite3";
 				PRODUCT_BUNDLE_IDENTIFIER = com.epiboly.legado;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -957,7 +961,7 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.1.22;
+				MARKETING_VERSION = 0.1.23;
 				OTHER_LDFLAGS = "$(inherited) -lsqlite3";
 				PRODUCT_BUNDLE_IDENTIFIER = com.epiboly.legado;
 				PRODUCT_NAME = "$(TARGET_NAME)";

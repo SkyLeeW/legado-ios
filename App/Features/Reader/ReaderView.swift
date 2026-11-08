@@ -120,7 +120,6 @@ struct ReaderView: View {
     @AppStorage("streamReadAloudAudio") private var streamReadAloudAudio = true
     @AppStorage("readAloudWakeLock") private var readAloudWakeLock = false
     @AppStorage("ignoreAudioFocus") private var ignoreAudioFocus = false
-    @AppStorage("pauseReadAloudWhilePhoneCalls") private var pauseReadAloudWhilePhoneCalls = false
     @AppStorage("mediaButtonPerNext") private var mediaButtonPerNext = false
     @AppStorage("ttsTimer") private var ttsTimer = 0
     @AppStorage("readerFullJustify") private var fullJustify = true
@@ -1703,9 +1702,7 @@ struct ReaderView: View {
                         .disabled(ttsFollowSystem)
                     if selectedHTTPEngine == nil { Toggle("按页朗读", isOn: $readAloudByPage) }
                     Toggle("朗读时保持亮屏", isOn: $readAloudWakeLock)
-                    Toggle("忽略音频焦点", isOn: $ignoreAudioFocus)
-                    Toggle("忽略焦点时仍在来电时暂停", isOn: $pauseReadAloudWhilePhoneCalls)
-                        .disabled(!ignoreAudioFocus)
+                    Toggle("与其他音频混播", isOn: $ignoreAudioFocus)
                     Toggle("媒体上一首/下一首切换章节", isOn: $mediaButtonPerNext)
                     Stepper("默认定时：\(ttsTimer) 分钟", value: $ttsTimer, in: 0...180)
                     if speechTimerRemaining > 0 {
@@ -2297,7 +2294,6 @@ struct ReaderView: View {
             streamsHTTPAudio: streamReadAloudAudio,
             voiceIdentifier: systemTTSVoice,
             ignoresAudioFocus: ignoreAudioFocus,
-            pausesForPhoneCalls: pauseReadAloudWhilePhoneCalls,
             mediaButtonPerNext: mediaButtonPerNext,
             bookName: model.book.name,
             chapterTitle: model.title,

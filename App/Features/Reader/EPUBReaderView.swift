@@ -232,6 +232,9 @@ final class EPUBReaderModel: ObservableObject, EPUBNavigatorDelegate {
 
     func clearError() { errorMessage = nil }
 
+    /// SwiftUI 已划分安全区域和工具栏，Readium 只在剩余正文视口内分页，不再重复扣除窗口边距。
+    func navigatorContentInset(_ navigator: VisualNavigator) -> UIEdgeInsets? { .zero }
+
     /// 位置同步失败直接显示原因，保留当前阅读画面供用户重试。
     func reportPositionError(_ error: Error) { errorMessage = error.localizedDescription }
 
@@ -292,7 +295,8 @@ struct EPUBReaderView: View {
         ReaderStylePreset.resolve(theme, themeMode: themeMode)
     }
 
-    var body: some View {
+    /// 正文、加载和错误页面共用工具栏之间的可见区域，让 Readium 按实际视口分页。
+    @ViewBuilder private var readerSurface: some View {
         Group {
             if let navigator = model.navigator {
                 EPUBNavigatorHost(navigator: navigator)
@@ -307,16 +311,25 @@ struct EPUBReaderView: View {
                 ProgressView("正在打开 EPUB…")
             }
         }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            topBar
+                .fixedSize(horizontal: false, vertical: true)
+                .opacity(model.showsControls ? 1 : 0)
+                .allowsHitTesting(model.showsControls)
+                .accessibilityHidden(!model.showsControls)
+            readerSurface
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            bottomBar
+                .fixedSize(horizontal: false, vertical: true)
+                .opacity(model.showsControls && model.navigator != nil ? 1 : 0)
+                .allowsHitTesting(model.showsControls && model.navigator != nil)
+                .accessibilityHidden(!model.showsControls || model.navigator == nil)
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // 工具栏叠加在正文上，不改变视口尺寸，避免开关菜单时触发 EPUB 重新分页。
-        .overlay(alignment: .top) {
-            if model.showsControls { topBar.background(Color(uiColor: resolvedStyle.background)) }
-        }
-        .overlay(alignment: .bottom) {
-            if model.showsControls, model.navigator != nil {
-                bottomBar.background(Color(uiColor: resolvedStyle.background))
-            }
-        }
+        // 隐藏菜单只改变可见性，工具栏版面始终保留，正文不会被覆盖或因菜单开关重新分页。
         .background(Color(uiColor: resolvedStyle.background).ignoresSafeArea())
         .foregroundStyle(Color(uiColor: resolvedStyle.foreground))
         .navigationBarHidden(true)

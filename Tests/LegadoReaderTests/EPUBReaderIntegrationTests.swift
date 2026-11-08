@@ -53,6 +53,10 @@ final class EPUBReaderIntegrationTests: XCTestCase {
             rect.bottom > 0 && rect.top < window.innerHeight)
         """, in: navigator)
         let originalBounds = navigator.view.bounds
+        let contentFrame = navigator.view.convert(navigator.view.bounds, to: window)
+        XCTAssertGreaterThan(contentFrame.minY, window.safeAreaInsets.top, "顶部工具栏必须位于正文视口之外")
+        XCTAssertLessThan(contentFrame.maxY, window.bounds.maxY - window.safeAreaInsets.bottom, "底部工具栏不能遮挡正文末行")
+        XCTAssertEqual(model.navigatorContentInset(navigator), UIEdgeInsets.zero, "安全区域已由 SwiftUI 布局处理，不应重复扣除")
         let visibleElement = await navigator.firstVisibleElementLocator()
         let originalVisible = try XCTUnwrap(visibleElement)
 

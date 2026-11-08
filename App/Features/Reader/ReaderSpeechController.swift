@@ -676,10 +676,9 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     private var continuesAcrossChapters = false
     private var notificationTokens: [NSObjectProtocol] = []
     nonisolated(unsafe) private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
-    private var resumesAfterInterruption = false
+    private var interruptionState = SpeechInterruptionState()
     private var isChangingSystemSegment = false
     private var ignoresAudioFocus = false
-    private var pausesForPhoneCalls = false
     private var mediaButtonPerNext = false
     private var bookName = ""
     private var chapterTitle = ""
@@ -718,6 +717,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
 
     /// 停止当前播放；只有自然续读才保留已经准备的下一段音频。
     func stop(preservingHTTPPreparation: Bool = false) {
+        interruptionState.cancelResume()
         // 换书、停止和关闭页面时作废当前会话，取消请求与恢复探测。
         httpSession = UUID()
         continuousHTTPQueue?.stop()
@@ -766,7 +766,6 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         streamsHTTPAudio: Bool = true,
         voiceIdentifier: String = "",
         ignoresAudioFocus: Bool = false,
-        pausesForPhoneCalls: Bool = false,
         mediaButtonPerNext: Bool = false,
         bookName: String = "",
         chapterTitle: String = "",
@@ -780,7 +779,6 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         self.streamsHTTPAudio = streamsHTTPAudio
         self.voiceIdentifier = voiceIdentifier
         self.ignoresAudioFocus = ignoresAudioFocus
-        self.pausesForPhoneCalls = pausesForPhoneCalls
         self.mediaButtonPerNext = mediaButtonPerNext
         self.bookName = bookName
         self.chapterTitle = chapterTitle
@@ -792,7 +790,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     func speak(_ text: String, continuesAcrossChapters: Bool = false, segmentIndexOffset: Int = 0) {
         stop()
         errorMessage = nil
-        activateAudioSession()
+        guard activateAudioSession() else { return }
         self.continuesAcrossChapters = continuesAcrossChapters
         if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.stopSpeaking(at: .immediate)
@@ -816,7 +814,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     ) {
         stop(preservingHTTPPreparation: true)
         errorMessage = nil
-        activateAudioSession()
+        guard activateAudioSession() else { return }
         self.continuesAcrossChapters = continuesAcrossChapters
         httpEngine = engine
         httpCachePolicy = cachePolicy
@@ -859,7 +857,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     func speakHTTPContinuously(engine: HttpTTS, units: [ReaderHTTPSpeechUnit], aheadCount: Int) {
         stop()
         errorMessage = nil
-        activateAudioSession()
+        guard activateAudioSession() else { return }
         let channels = usesChannelFailover
             ? [engine] + configuredBackupEngines.filter { $0.id != engine.id } : [engine]
         let queue = ReaderHTTPSpeechQueue(service: httpService, channels: channels, rate: speechRate + 5,
@@ -932,22 +930,31 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         return values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     }
 
-    private func activateAudioSession() {
+    /// 语音会话允许导航临时中断；激活失败明确显示原因，不能继续伪装成正在播放。
+    private func activateAudioSession() -> Bool {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .spokenAudio, options: ignoresAudioFocus ? [.mixWithOthers] : [])
-        try? session.setActive(true)
+        do {
+            try session.setCategory(.playback, mode: .spokenAudio, options: ignoresAudioFocus ? [.mixWithOthers] : [])
+            try session.setActive(true)
+            return true
+        } catch {
+            errorMessage = "无法启用听书音频：\(error.localizedDescription)"
+            return false
+        }
     }
 
-    private func pausePlayback() {
+    /// 暂停保留播放器和进度；用户主动暂停时取消导航结束后的自动续播。
+    private func pausePlayback(causedByInterruption: Bool = false) {
+        if !causedByInterruption { interruptionState.cancelResume() }
         if let continuousHTTPQueue {
             continuousHTTPQueue.pause()
             return
         }
-        if let audioPlayer, audioPlayer.isPlaying {
+        if let audioPlayer {
             audioPlayer.pause()
         } else if let streamPlayer {
             streamPlayer.pause()
-        } else if synthesizer.isSpeaking {
+        } else if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.pauseSpeaking(at: .word)
         } else if httpTask != nil {
             httpTask?.cancel()
@@ -962,8 +969,10 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         updateNowPlaying()
     }
 
+    /// 系统允许恢复后先重新激活音频会话，再从原播放器位置继续，保留已生成的缓存。
     private func resumePlayback() {
-        activateAudioSession()
+        interruptionState.cancelResume()
+        guard activateAudioSession() else { return }
         if let continuousHTTPQueue {
             continuousHTTPQueue.resume()
             return
@@ -1008,19 +1017,18 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
         })
     }
 
+    /// 所有系统中断都更新真实播放状态，混播设置不能通过忽略通知绕过导航或来电。
     private func handleAudioInterruption(type raw: UInt?, options rawOptions: UInt) {
         guard let raw,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
-            if ignoresAudioFocus && !pausesForPhoneCalls { return }
-            resumesAfterInterruption = isSpeaking
-            if isSpeaking { pausePlayback() }
+            if interruptionState.begin(wasPlaying: isSpeaking) {
+                pausePlayback(causedByInterruption: true)
+            }
         case .ended:
-            if ignoresAudioFocus && !pausesForPhoneCalls { return }
             let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
-            if resumesAfterInterruption, options.contains(.shouldResume) { resumePlayback() }
-            resumesAfterInterruption = false
+            if interruptionState.end(allowsResume: options.contains(.shouldResume)) { resumePlayback() }
         @unknown default:
             break
         }
@@ -1029,6 +1037,7 @@ final class ReaderSpeechController: NSObject, ObservableObject, @preconcurrency 
     private func handleRouteChange(reason raw: UInt?) {
         guard let raw,
               AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
+        interruptionState.cancelResume()
         if isSpeaking { pausePlayback() }
     }
 
