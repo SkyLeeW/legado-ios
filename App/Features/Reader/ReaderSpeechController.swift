@@ -38,10 +38,10 @@ struct ReaderHTTPSpeechUnit: Identifiable, Equatable, Sendable {
         return units
     }
 
-    /// 以实际分页的起点划分连续正文，重叠的可见行只朗读一次，末页保留全部剩余文字。
+    /// 以阅读页为目标长度并顺延到完整句末，跨页句子不拆成两次合成，原文不重复或遗漏。
     static func pages(chapterIndex: Int, title: String, text: String, position: Int, ranges: [NSRange]) -> [Self] {
         let source = text as NSString
-        return SpeechTextPartition.pages(text: text, position: position, visibleRanges: ranges).compactMap { range in
+        return SpeechTextPartition.sentenceAlignedPages(text: text, position: position, visibleRanges: ranges).compactMap { range in
             let value = source.substring(with: range)
             guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return .init(chapterIndex: chapterIndex, chapterTitle: title, position: range.location, text: value)
@@ -57,7 +57,7 @@ struct ReaderHTTPSpeechPosition: Equatable {
 
 /// 连续听书使用单一生成队列和滑动缓存窗口，播放器换段不会取消生成任务。
 @MainActor
-private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlayerDelegate {
+private final class ReaderHTTPSpeechQueue: NSObject {
     /// 本地缓存写入错误不属于渠道故障，不能通过切换渠道重复发起付费合成。
     private struct CacheWriteError: LocalizedError {
         let underlying: Error
@@ -67,6 +67,14 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         let engine: HttpTTS
         let fileURL: URL
         let speechBoundaries: [HttpTTSSpeechBoundary]
+    }
+    /// 每份已入队音频持有独立事件订阅，消费或替换时一并释放，避免旧通知影响新播放计划。
+    private struct Enqueued {
+        let identity: UUID
+        let item: AVPlayerItem
+        let statusObservation: NSKeyValueObservation
+        let completionToken: NSObjectProtocol
+        let failureToken: NSObjectProtocol
     }
     private let service: HttpTTSService
     private let channels: [HttpTTS]
@@ -93,7 +101,11 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private var generationError: String?
     private var failedUntil: [Int64: Date] = [:]
     private var channelErrors: [Int64: String] = [:]
-    private var player: AVAudioPlayer?
+    private let player = AVQueuePlayer()
+    private var enqueued: [UUID: Enqueued] = [:]
+    private var completed: Set<UUID> = []
+    private var activeUnitID: UUID?
+    private var playbackObservation: NSKeyValueObservation?
     private var activeEngine: HttpTTS?
     private var reachedEnd = false
     private var planningError: String?
@@ -124,6 +136,13 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 首次启动仅等待第一份音频，其余缓存会在播放期间按顺序补足。
     func start() {
+        player.actionAtItemEnd = .advance
+        playbackObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in
+                self?.reportPlaybackPosition()
+                self?.publishStatus()
+            }
+        }
         // 读取播放器实际时间，暂停和等待音频期间不推进文字位置。
         progressTask = Task { [weak self] in
             do {
@@ -175,7 +194,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     /// 暂停播放保留缓存窗口，后台生成仍可完成已经计划的后续音频。
     func pause() {
         isPaused = true
-        player?.pause()
+        player.pause()
         publishStatus()
     }
 
@@ -185,11 +204,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         generationBlocked = false
         generationError = nil
         publishErrors()
-        if let player {
-            if !player.play() { playbackFailed(CocoaError(.fileReadCorruptFile)) }
-        } else {
-            playIfReady()
-        }
+        playIfReady()
         fillBuffer()
         publishStatus()
     }
@@ -198,8 +213,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     func skip(_ direction: Int) {
         let target = index + direction
         guard units.indices.contains(target) else { return }
-        player?.stop()
-        player = nil
+        clearPlaybackQueue()
         worker?.cancel()
         worker = nil
         workerID = UUID()
@@ -222,8 +236,9 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         recoveryTimer?.cancel()
         progressTask?.cancel()
         recoveryProbe?.cancel()
-        player?.stop()
-        player = nil
+        playbackObservation?.invalidate()
+        playbackObservation = nil
+        clearPlaybackQueue()
         prepared.removeAll()
         if createdDirectory {
             do { try FileManager.default.removeItem(at: directory) }
@@ -250,7 +265,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
                     publishStatus()
                     let value = try await synthesize(unit)
                     try Task.checkCancellation()
-                    if target > index || (target == index && player == nil) {
+                    if target >= index && !hasEnteredPlayback(unit.id) {
                         store(value, for: unit)
                     } else {
                         removeFile(value.fileURL)
@@ -275,6 +290,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 缺失音频或备用渠道缓存尚未切回已恢复的首选渠道时，需要补充相应缓存。
     private func needsPreparation(at target: Int) -> Bool {
+        if hasEnteredPlayback(units[target].id) { return false }
         guard let value = prepared[units[target].id] else { return true }
         guard target > index, let preferred = channels.firstIndex(where: { failedUntil[$0.id] == nil }),
               let actual = channels.firstIndex(where: { $0.id == value.engine.id }) else { return false }
@@ -323,6 +339,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             let oldRank = channels.firstIndex(where: { $0.id == previous.engine.id })!
             let newRank = channels.firstIndex(where: { $0.id == value.engine.id })!
             if oldRank < newRank { removeFile(value.fileURL); return }
+            removeEnqueued(unit.id)
             removeFile(previous.fileURL)
         }
         prepared[unit.id] = value
@@ -348,7 +365,8 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
 
     /// 播放备用渠道时，选择到期且未被生成任务占用的高优先级渠道进行恢复探测。
     private var recoveryCandidate: (HttpTTS, ReaderHTTPSpeechUnit)? {
-        guard !generationBlocked, !isPaused, player != nil, units.indices.contains(index + 1),
+        guard !generationBlocked, !isPaused, player.currentItem != nil, units.indices.contains(index + 1),
+              !hasEnteredPlayback(units[index + 1].id),
               let activeEngine, let activeIndex = channels.firstIndex(where: { $0.id == activeEngine.id }) else { return nil }
         for engine in channels.prefix(activeIndex) {
             if engine.id == generatingRequest?.engineID { continue }
@@ -392,7 +410,7 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
             let value = try await prepare(engine: engine, unit: unit, reload: true)
             markHealthy(engine)
             let target = units.firstIndex(where: { $0.id == unit.id })!
-            if target > index || (target == index && player == nil) {
+            if target >= index && !hasEnteredPlayback(unit.id) {
                 store(value, for: unit)
                 if target == index {
                     worker?.cancel()
@@ -432,36 +450,78 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         onError?(messages.isEmpty ? nil : messages.joined(separator: "\n"))
     }
 
-    /// 只有真正开始播放才发布正文位置，等待生成时不提前跳页或清除当前文字。
+    /// 连续缓存生成完成后立即按正文顺序入队，由同一个播放器预载并自动衔接，换段不再打开新播放器。
     private func playIfReady() {
-        guard !stopped, !isPaused, player == nil else { publishStatus(); return }
+        guard !stopped else { return }
         guard units.indices.contains(index) else {
             if reachedEnd { onFinish?() }
             else { onNeedMore?(); publishStatus() }
             return
         }
-        guard let value = prepared[units[index].id] else { publishStatus(); return }
-        activeEngine = value.engine
-        do {
-            let audioPlayer = try AVAudioPlayer(contentsOf: value.fileURL)
-            audioPlayer.delegate = self
-            player = audioPlayer
-            guard audioPlayer.prepareToPlay(), audioPlayer.play() else { throw CocoaError(.fileReadCorruptFile) }
-        } catch {
-            playbackFailed(error)
-            return
+        let remainingItems = player.items()
+        var precedingItem: AVPlayerItem?
+        let end = min(units.count, index + aheadCount + 1)
+        for unit in units[index..<end] {
+            guard let value = prepared[unit.id] else { break }
+            if let entry = enqueued[unit.id] {
+                if remainingItems.contains(where: { $0 === entry.item }) { precedingItem = entry.item }
+                continue
+            }
+            let entry = enqueue(value, unitID: unit.id)
+            player.insert(entry.item, after: precedingItem)
+            precedingItem = entry.item
         }
-        onAdvance?(units[index])
-        reportedPosition = ReaderHTTPSpeechPosition(chapterIndex: units[index].chapterIndex, position: units[index].position)
+        if !isPaused, player.currentItem != nil { player.play() }
+        reportPlaybackPosition()
         publishStatus()
     }
 
-    /// 用词边界定位同一份缓存内的正文，读到下一页时即可同步画面。
+    /// 每份音频在入队时注册播放结束和失败事件，准备失败明确报告，不把损坏音频当作已读正文。
+    private func enqueue(_ value: Prepared, unitID: UUID) -> Enqueued {
+        let identity = UUID()
+        let item = AVPlayerItem(url: value.fileURL)
+        let observation = item.observe(\.status, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in
+                guard let self, !self.stopped, let entry = self.enqueued[unitID],
+                      entry.identity == identity, entry.item.status == .failed else { return }
+                self.playbackFailed(entry.item.error!, unitID: unitID, identity: identity)
+            }
+        }
+        let center = NotificationCenter.default
+        let completion = center.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.completeAudio(unitID, identity: identity) }
+        }
+        let failure = center.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main) { [weak self] note in
+            let error = note.userInfo![AVPlayerItemFailedToPlayToEndTimeErrorKey] as! Error
+            Task { @MainActor in self?.playbackFailed(error, unitID: unitID, identity: identity) }
+        }
+        let entry = Enqueued(identity: identity, item: item, statusObservation: observation, completionToken: completion, failureToken: failure)
+        enqueued[unitID] = entry
+        return entry
+    }
+
+    /// 已成为当前项或已由播放器消费的音频不能再被渠道恢复任务替换，避免重读或删除正在使用的文件。
+    private func hasEnteredPlayback(_ unitID: UUID) -> Bool {
+        guard let entry = enqueued[unitID] else { return false }
+        return player.currentItem === entry.item || !player.items().contains(where: { $0 === entry.item })
+    }
+
+    /// 跟随播放器真正开始的音频更新正文，支持词边界的渠道继续使用真实时间轴定位。
     private func reportPlaybackPosition() {
-        guard !stopped, !isPaused, let player, player.isPlaying else { return }
+        guard !stopped, !isPaused, player.timeControlStatus == .playing, let item = player.currentItem else { return }
+        let unitID = enqueued.first(where: { $0.value.item === item })!.key
+        // 播放器可能先切换当前项，再送达上一项的结束通知；先提交上一项进度，再发布新项位置。
+        guard units.indices.contains(index), units[index].id == unitID else { return }
         let unit = units[index]
         let value = prepared[unit.id]!
-        guard let offset = HttpTTSSpeechBoundary.position(at: player.currentTime, in: value.speechBoundaries) else { return }
+        if activeUnitID != unitID {
+            activeUnitID = unitID
+            activeEngine = value.engine
+            reportedPosition = ReaderHTTPSpeechPosition(chapterIndex: unit.chapterIndex, position: unit.position)
+            onAdvance?(unit)
+            publishStatus()
+        }
+        guard let offset = HttpTTSSpeechBoundary.position(at: player.currentTime().seconds, in: value.speechBoundaries) else { return }
         let position = ReaderHTTPSpeechPosition(chapterIndex: unit.chapterIndex, position: unit.position + offset)
         if position != reportedPosition {
             reportedPosition = position
@@ -469,33 +529,56 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
         }
     }
 
-    /// 播放失败从同一份正文重新选择渠道，不触发下一段或下一章的进度。
-    private func playbackFailed(_ error: Error) {
-        recordFailure(activeEngine!, error: error)
+    /// 失败项及其后续项退出播放队列，保留正文和缓存；修复当前失败项后才能继续，不能跳过未读内容。
+    private func playbackFailed(_ error: Error, unitID: UUID, identity: UUID) {
+        guard !stopped, enqueued[unitID]?.identity == identity else { return }
+        recordFailure(prepared[unitID]!.engine, error: error)
         if !retriesChannels {
             generationBlocked = true
             generationError = error.localizedDescription
             publishErrors()
         }
-        player?.stop()
-        player = nil
-        if let value = prepared[units[index].id] { removeFile(value.fileURL) }
-        prepared[units[index].id] = nil
+        let target = units.firstIndex(where: { $0.id == unitID })!
+        for unit in units[target...].reversed() {
+            removeEnqueued(unit.id)
+            completed.remove(unit.id)
+        }
+        removeFile(prepared.removeValue(forKey: unitID)!.fileURL)
         fillBuffer()
         publishStatus()
     }
 
-    /// 播放结束立即衔接下一份已验证的音频文件，再异步补充缓存窗口。
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        guard player === self.player, !stopped else { return }
-        if !flag { playbackFailed(CocoaError(.fileReadCorruptFile)); return }
-        onComplete?(units[index])
-        self.player = nil
-        removeFile(prepared[units[index].id]!.fileURL)
-        prepared[units[index].id] = nil
-        index += 1
+    /// 播放器自行衔接下一项，结束通知只按正文顺序提交进度和回收文件，不参与音频启动时机。
+    private func completeAudio(_ unitID: UUID, identity: UUID) {
+        guard !stopped, enqueued[unitID]?.identity == identity else { return }
+        completed.insert(unitID)
+        while units.indices.contains(index), completed.remove(units[index].id) != nil {
+            let unit = units[index]
+            onComplete?(unit)
+            removeEnqueued(unit.id, removesItem: false)
+            removeFile(prepared.removeValue(forKey: unit.id)!.fileURL)
+            index += 1
+        }
         playIfReady()
         fillBuffer()
+    }
+
+    /// 替换缓存或消费音频时取消该项订阅；自然播放结束由 AVQueuePlayer 自动移除当前项。
+    private func removeEnqueued(_ unitID: UUID, removesItem: Bool = true) {
+        guard let entry = enqueued.removeValue(forKey: unitID) else { return }
+        entry.statusObservation.invalidate()
+        NotificationCenter.default.removeObserver(entry.completionToken)
+        NotificationCenter.default.removeObserver(entry.failureToken)
+        if removesItem { player.remove(entry.item) }
+        if activeUnitID == unitID { activeUnitID = nil; activeEngine = nil }
+    }
+
+    /// 用户跳段或停止时一次释放整个播放计划，已排队的结束通知不再改变新位置。
+    private func clearPlaybackQueue() {
+        player.pause()
+        for id in Array(enqueued.keys) { removeEnqueued(id, removesItem: false) }
+        player.removeAllItems()
+        completed.removeAll()
     }
 
     /// 已消费或被恢复渠道替换的文件及时删除，清理失败明确显示而不隐藏错误。
@@ -508,11 +591,12 @@ private final class ReaderHTTPSpeechQueue: NSObject, @preconcurrency AVAudioPlay
     private func publishStatus() {
         guard !stopped else { return }
         let ready = units.dropFirst(index + 1).filter { prepared[$0.id] != nil }.count
-        let state = isPaused ? "已暂停" : (player != nil ? "播放中" : "等待音频")
+        let isPlaying = player.timeControlStatus == .playing
+        let state = isPaused ? "已暂停" : (isPlaying ? "播放中" : "等待音频")
         let channel = activeEngine.map { " · \($0.name)" } ?? ""
         let detail = generationError.map { "音频生成失败：\($0)" } ?? generationStatus
         let loading = detail.isEmpty ? "" : " · \(detail)"
-        onStatus?("\(state)\(channel) · 已缓存 \(ready)/\(aheadCount) 份\(loading)", !isPaused && player == nil)
+        onStatus?("\(state)\(channel) · 已缓存 \(ready)/\(aheadCount) 份\(loading)", !isPaused && !isPlaying)
     }
 }
 

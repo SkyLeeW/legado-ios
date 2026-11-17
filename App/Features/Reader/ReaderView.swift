@@ -1719,7 +1719,7 @@ struct ReaderView: View {
                 if selectedHTTPEngine != nil {
                     Section {
                         if selectedHTTPEngine?.mimo != nil {
-                            Text("MiMo 按阅读页缓存，播完一页后切换下一页。")
+                            Text("MiMo 按阅读页长度缓存，跨页句子读完整后再切换音频并翻页。")
                         } else {
                             Picker("每份缓存", selection: $ttsCacheUnit) {
                                 Text("按字数").tag("characters")
@@ -2097,10 +2097,10 @@ struct ReaderView: View {
         startConfiguredSpeech()
     }
 
-    /// 按所选渠道创建连续播放计划，MiMo 使用真实阅读页作为可同步的音频边界。
+    /// 按所选渠道创建连续播放计划，MiMo 以阅读页为目标长度，在完整句末切换音频并同步进度。
     private func startConfiguredSpeech() {
         if let engine = selectedHTTPEngine {
-            // MiMo 没有文字时间轴，按真实阅读页合成才能在确定的音频边界切页。
+            // MiMo 没有文字时间轴，按完整句末的音频边界同步页面，不能按时长估算页内进度。
             speechUsesPageUnits = engine.mimo != nil
             speechPrefetchTask?.cancel()
             speechPrefetchTask = nil
@@ -2174,7 +2174,7 @@ struct ReaderView: View {
         speakPage(at: speechPageIndex)
     }
 
-    /// 缓存单位始终使用原章的字符位置，半章按整章长度划分而不按当前页估算。
+    /// MiMo 在页间完整句末划分缓存，其余渠道按所选单位处理，所有分段保留原章字符位置。
     private func makeHTTPUnits(index: Int, title: String, content: String, position: Int = 0) -> [ReaderHTTPSpeechUnit] {
         if speechUsesPageUnits {
             let ranges = index == model.currentIndex ? readerPageRanges
