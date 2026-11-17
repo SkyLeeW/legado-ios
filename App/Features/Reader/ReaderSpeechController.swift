@@ -106,6 +106,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
     private var completed: Set<UUID> = []
     private var activeUnitID: UUID?
     private var playbackObservation: NSKeyValueObservation?
+    private var currentItemObservation: NSKeyValueObservation?
     private var preparationBackgroundTask = UIBackgroundTaskIdentifier.invalid
     private var activeEngine: HttpTTS?
     private var reachedEnd = false
@@ -138,6 +139,9 @@ private final class ReaderHTTPSpeechQueue: NSObject {
     /// 首次启动仅等待第一份音频，其余缓存会在播放期间按顺序补足。
     func start() {
         player.actionAtItemEnd = .advance
+        currentItemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in self?.synchronizePlayback() }
+        }
         playbackObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
                 self?.reportPlaybackPosition()
@@ -282,6 +286,8 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         recoveryProbe?.cancel()
         playbackObservation?.invalidate()
         playbackObservation = nil
+        currentItemObservation?.invalidate()
+        currentItemObservation = nil
         endPreparationBackgroundTask()
         clearPlaybackQueue()
         prepared.removeAll()
@@ -310,7 +316,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
                     publishStatus()
                     let value = try await synthesize(unit)
                     try Task.checkCancellation()
-                    if target >= index && !hasEnteredPlayback(unit.id) {
+                    if target >= index && !isEnqueued(unit.id) {
                         store(value, for: unit)
                     } else {
                         removeFile(value.fileURL)
@@ -334,9 +340,9 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         }
     }
 
-    /// 缺失音频或备用渠道缓存尚未切回已恢复的首选渠道时，需要补充相应缓存。
+    /// 已入队音频是不可变的播放计划，只为尚未入队的正文补充或更新渠道缓存。
     private func needsPreparation(at target: Int) -> Bool {
-        if hasEnteredPlayback(units[target].id) { return false }
+        if isEnqueued(units[target].id) { return false }
         guard let value = prepared[units[target].id] else { return true }
         guard target > index, let preferred = channels.firstIndex(where: { failedUntil[$0.id] == nil }),
               let actual = channels.firstIndex(where: { $0.id == value.engine.id }) else { return false }
@@ -385,7 +391,6 @@ private final class ReaderHTTPSpeechQueue: NSObject {
             let oldRank = channels.firstIndex(where: { $0.id == previous.engine.id })!
             let newRank = channels.firstIndex(where: { $0.id == value.engine.id })!
             if oldRank < newRank { removeFile(value.fileURL); return }
-            removeEnqueued(unit.id)
             removeFile(previous.fileURL)
         }
         prepared[unit.id] = value
@@ -409,14 +414,14 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         }
     }
 
-    /// 播放备用渠道时，选择到期且未被生成任务占用的高优先级渠道进行恢复探测。
+    /// 播放备用渠道时，用下一份尚未入队的正文探测首选渠道，已经提交的音频不再替换。
     private var recoveryCandidate: (HttpTTS, ReaderHTTPSpeechUnit)? {
-        guard !generationBlocked, !isPaused, player.currentItem != nil, units.indices.contains(index + 1),
-              !hasEnteredPlayback(units[index + 1].id),
+        guard !generationBlocked, !isPaused, player.currentItem != nil,
+              let unit = units.dropFirst(index + 1).first(where: { !isEnqueued($0.id) }),
               let activeEngine, let activeIndex = channels.firstIndex(where: { $0.id == activeEngine.id }) else { return nil }
         for engine in channels.prefix(activeIndex) {
             if engine.id == generatingRequest?.engineID { continue }
-            if let date = failedUntil[engine.id], date <= Date() { return (engine, units[index + 1]) }
+            if let date = failedUntil[engine.id], date <= Date() { return (engine, unit) }
         }
         return nil
     }
@@ -456,7 +461,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
             let value = try await prepare(engine: engine, unit: unit, reload: true)
             markHealthy(engine)
             let target = units.firstIndex(where: { $0.id == unit.id })!
-            if target >= index && !hasEnteredPlayback(unit.id) {
+            if target >= index && !isEnqueued(unit.id) {
                 store(value, for: unit)
                 if target == index {
                     worker?.cancel()
@@ -511,20 +516,15 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         if !isPaused, !generationBlocked, player.timeControlStatus != .playing {
             guard beginPreparationBackgroundTask() else { return }
         }
-        let remainingItems = player.items()
-        var precedingItem: AVPlayerItem?
         let end = min(units.count, index + aheadCount + 1)
         for unit in units[index..<end] {
             guard let value = prepared[unit.id] else { break }
-            if let entry = enqueued[unit.id] {
-                if remainingItems.contains(where: { $0 === entry.item }) { precedingItem = entry.item }
-                continue
-            }
+            if isEnqueued(unit.id) { continue }
             let entry = enqueue(value, unitID: unit.id)
-            player.insert(entry.item, after: precedingItem)
-            precedingItem = entry.item
+            // nil 表示原子追加队尾，不保留会被 AVQueuePlayer 在其他线程自动移除的前驱项目。
+            player.insert(entry.item, after: nil)
         }
-        if !isPaused, player.currentItem != nil { player.play() }
+        if !isPaused, !completed.contains(units[index].id), player.currentItem != nil { player.play() }
         reportPlaybackPosition()
         publishStatus()
     }
@@ -553,23 +553,23 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         return entry
     }
 
-    /// 已成为当前项或已由播放器消费的音频不能再被渠道恢复任务替换，避免重读或删除正在使用的文件。
-    private func hasEnteredPlayback(_ unitID: UUID) -> Bool {
-        guard let entry = enqueued[unitID] else { return false }
-        return player.currentItem === entry.item || !player.items().contains(where: { $0 === entry.item })
+    /// 音频交给播放器后固定其文件和顺序，直到自然消费或用户明确停止、跳段才解除提交。
+    private func isEnqueued(_ unitID: UUID) -> Bool {
+        enqueued[unitID] != nil
     }
 
     /// 跟随播放器真正开始的音频更新正文，支持词边界的渠道继续使用真实时间轴定位。
     private func reportPlaybackPosition() {
-        guard !stopped, !isPaused, player.timeControlStatus == .playing, let item = player.currentItem else { return }
-        let unitID = enqueued.first(where: { $0.value.item === item })!.key
-        // 播放器可能先切换当前项，再送达上一项的结束通知；先提交上一项进度，再发布新项位置。
-        guard units.indices.contains(index), units[index].id == unitID else { return }
+        guard !stopped, !isPaused, player.timeControlStatus == .playing,
+              let item = player.currentItem, units.indices.contains(index) else { return }
         let unit = units[index]
+        // 当前消费项保留到结束与脱离播放器均已确认；通知先后顺序不同期间不发布下一项进度。
+        let entry = enqueued[unit.id]!
+        guard entry.item === item, !completed.contains(unit.id) else { return }
         let value = prepared[unit.id]!
         endPreparationBackgroundTask()
-        if activeUnitID != unitID {
-            activeUnitID = unitID
+        if activeUnitID != unit.id {
+            activeUnitID = unit.id
             activeEngine = value.engine
             reportedPosition = ReaderHTTPSpeechPosition(chapterIndex: unit.chapterIndex, position: unit.position)
             onAdvance?(unit)
@@ -602,12 +602,21 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         publishStatus()
     }
 
-    /// 播放器自行衔接下一项，结束通知只按正文顺序提交进度和回收文件，不参与音频启动时机。
+    /// 结束通知只记录音频已播完，不能据此假定播放器的 currentItem 已经切换。
     private func completeAudio(_ unitID: UUID, identity: UUID) {
         guard !stopped, enqueued[unitID]?.identity == identity else { return }
         completed.insert(unitID)
-        while units.indices.contains(index), completed.remove(units[index].id) != nil {
+        synchronizePlayback()
+    }
+
+    /// 播放结束和当前项切换可以任意先后到达，只有两者都成立才提交进度并释放原音频。
+    private func synchronizePlayback() {
+        guard !stopped else { return }
+        while units.indices.contains(index), completed.contains(units[index].id) {
             let unit = units[index]
+            let entry = enqueued[unit.id]!
+            if player.currentItem === entry.item { break }
+            completed.remove(unit.id)
             onComplete?(unit)
             removeEnqueued(unit.id, removesItem: false)
             removeFile(prepared.removeValue(forKey: unit.id)!.fileURL)
@@ -630,8 +639,8 @@ private final class ReaderHTTPSpeechQueue: NSObject {
     /// 用户跳段或停止时一次释放整个播放计划，已排队的结束通知不再改变新位置。
     private func clearPlaybackQueue() {
         player.pause()
-        for id in Array(enqueued.keys) { removeEnqueued(id, removesItem: false) }
         player.removeAllItems()
+        for id in Array(enqueued.keys) { removeEnqueued(id, removesItem: false) }
         completed.removeAll()
     }
 

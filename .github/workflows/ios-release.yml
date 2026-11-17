@@ -92,8 +92,46 @@ jobs:
             -disableAutomaticPackageResolution \
             -archivePath artifacts/Legado.xcarchive \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             archive 2>&1 | tee artifacts/archive.log
+
+      - name: 核对崩溃诊断符号
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          # 符号文件必须与实际归档的可执行文件具有同一 UUID，才能准确还原崩溃地址。
+          paths = {
+              "app": "artifacts/Legado.xcarchive/Products/Applications/Legado.app/Legado",
+              "dsym": "artifacts/Legado.xcarchive/dSYMs/Legado.app.dSYM",
+          }
+          outputs = {
+              name: subprocess.check_output(["xcrun", "dwarfdump", "--uuid", path], text=True).strip()
+              for name, path in paths.items()
+          }
+          uuids = {name: value.split()[1] for name, value in outputs.items()}
+          assert uuids["app"] == uuids["dsym"], "崩溃诊断符号与安装包的 UUID 不一致"
+          Path("artifacts/symbols.json").write_text(
+              json.dumps({"commit": os.environ["GITHUB_SHA"], "uuids": uuids, "details": outputs}, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(outputs["app"])
+          print(outputs["dsym"])
+          PY
+
+      - name: 保存崩溃诊断符号
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7，固定上游提交
+        with:
+          name: legado-ios-symbols-${{ steps.version.outputs.tag }}
+          path: |
+            artifacts/Legado.xcarchive/dSYMs/Legado.app.dSYM
+            artifacts/symbols.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: 打包并核验 IPA
         env:
