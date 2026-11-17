@@ -351,8 +351,8 @@ public actor HttpTTSService {
             let text: String
         }
         struct EdgeCacheInput: Encodable {
-            /// 新格式包含文字时间轴，与先前仅有 MP3 的缓存使用不同标识。
-            let formatVersion = 2
+            /// 句末分帧会改变合成音频和时间轴，不能复用旧版本按字节截断的 Edge 缓存。
+            let formatVersion = 3
             let engineID: Int64
             let configuration: EdgeTTSConfiguration
             let text: String

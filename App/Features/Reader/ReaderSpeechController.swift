@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 @preconcurrency import MediaPlayer
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// 音频缓存单位保留原章位置，合成分块不修改阅读器的正文或分页。
@@ -11,7 +12,7 @@ struct ReaderHTTPSpeechUnit: Identifiable, Equatable, Sendable {
     let position: Int
     let text: String
 
-    /// 按完整字符划分字数、半章或整章，从阅读位置开始保留所有尚未朗读的正文。
+    /// 按字数、半章或整章确定目标长度，再交给统一句末分段算法，保留起播后的全部正文。
     static func make(chapterIndex: Int, title: String, text: String, position: Int, mode: String, characterCount: Int) -> [Self] {
         let characters = Array(text)
         let size: Int
@@ -20,28 +21,27 @@ struct ReaderHTTPSpeechUnit: Identifiable, Equatable, Sendable {
         case "chapter": size = max(characters.count, 1)
         default: size = characterCount
         }
-        var units: [Self] = []
+        var boundaries: [Int] = []
         var offset = 0
         for start in stride(from: 0, to: characters.count, by: size) {
             let value = String(characters[start..<min(start + size, characters.count)])
-            let end = offset + value.utf16.count
-            if end > position {
-                let spokenStart = max(offset, position)
-                let range = NSRange(location: spokenStart - offset, length: end - spokenStart)
-                let spokenText = (value as NSString).substring(with: range)
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    units.append(.init(chapterIndex: chapterIndex, chapterTitle: title, position: spokenStart, text: spokenText))
-                }
-            }
-            offset = end
+            offset += value.utf16.count
+            boundaries.append(offset)
         }
-        return units
+        let ranges = SpeechTextPartition.alignedToSentences(text: text, position: position, preferredBoundaries: boundaries)
+        return make(chapterIndex: chapterIndex, title: title, text: text, ranges: ranges)
     }
 
     /// 以阅读页为目标长度并顺延到完整句末，跨页句子不拆成两次合成，原文不重复或遗漏。
     static func pages(chapterIndex: Int, title: String, text: String, position: Int, ranges: [NSRange]) -> [Self] {
+        let aligned = SpeechTextPartition.sentenceAlignedPages(text: text, position: position, visibleRanges: ranges)
+        return make(chapterIndex: chapterIndex, title: title, text: text, ranges: aligned)
+    }
+
+    /// 分段只选择原文范围，不改写文字；只含空白的范围不提交给语音服务。
+    private static func make(chapterIndex: Int, title: String, text: String, ranges: [NSRange]) -> [Self] {
         let source = text as NSString
-        return SpeechTextPartition.sentenceAlignedPages(text: text, position: position, visibleRanges: ranges).compactMap { range in
+        return ranges.compactMap { range in
             let value = source.substring(with: range)
             guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return .init(chapterIndex: chapterIndex, chapterTitle: title, position: range.location, text: value)
@@ -106,6 +106,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
     private var completed: Set<UUID> = []
     private var activeUnitID: UUID?
     private var playbackObservation: NSKeyValueObservation?
+    private var preparationBackgroundTask = UIBackgroundTaskIdentifier.invalid
     private var activeEngine: HttpTTS?
     private var reachedEnd = false
     private var planningError: String?
@@ -172,8 +173,48 @@ private final class ReaderHTTPSpeechQueue: NSObject {
                 self?.onError?(error.localizedDescription)
             }
         }
+        guard beginPreparationBackgroundTask() else { return }
         playIfReady()
         fillBuffer()
+    }
+
+    /// 在首次准备或恢复播放之前申请系统后台执行时间，覆盖还没有真实音频播放的合成等待。
+    private func beginPreparationBackgroundTask() -> Bool {
+        if preparationBackgroundTask != .invalid { return true }
+        preparationBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "听书音频准备") { [weak self] in
+            self?.expirePreparationBackgroundTask(message: "系统分配的后台听书准备时间已用完，请回到前台继续播放。")
+        }
+        if preparationBackgroundTask == .invalid {
+            expirePreparationBackgroundTask(message: "系统未允许后台准备听书，请保持前台后继续播放。")
+            return false
+        }
+        return true
+    }
+
+    /// 真正播放、用户暂停、停止或准备失败后及时结束申请，后台持续播放由系统音频模式管理。
+    private func endPreparationBackgroundTask() {
+        guard preparationBackgroundTask != .invalid else { return }
+        let identifier = preparationBackgroundTask
+        preparationBackgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(identifier)
+    }
+
+    /// 系统收回后台准备时间时暂停并保留计划，取消未完成请求，明确显示原因而不假装继续生成。
+    private func expirePreparationBackgroundTask(message: String) {
+        worker?.cancel()
+        worker = nil
+        workerID = UUID()
+        waitingForChannels = false
+        recoveryProbe?.cancel()
+        recoveryProbe = nil
+        probingEngineID = nil
+        generationBlocked = true
+        generationError = message
+        isPaused = true
+        player.pause()
+        endPreparationBackgroundTask()
+        publishErrors()
+        publishStatus()
     }
 
     /// 追加章节只扩展播放计划，已生成和正在生成的音频保持原来的生命周期。
@@ -195,6 +236,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
     func pause() {
         isPaused = true
         player.pause()
+        endPreparationBackgroundTask()
         publishStatus()
     }
 
@@ -204,6 +246,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         generationBlocked = false
         generationError = nil
         publishErrors()
+        guard beginPreparationBackgroundTask() else { return }
         playIfReady()
         fillBuffer()
         publishStatus()
@@ -225,6 +268,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
             removeFile(prepared.removeValue(forKey: id)!.fileURL)
         }
         isPaused = false
+        guard beginPreparationBackgroundTask() else { return }
         playIfReady()
         fillBuffer()
     }
@@ -238,6 +282,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         recoveryProbe?.cancel()
         playbackObservation?.invalidate()
         playbackObservation = nil
+        endPreparationBackgroundTask()
         clearPlaybackQueue()
         prepared.removeAll()
         if createdDirectory {
@@ -283,6 +328,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
                 generationError = error.localizedDescription
                 publishErrors()
                 generationStatus = "音频生成失败：\(error.localizedDescription)"
+                endPreparationBackgroundTask()
                 publishStatus()
             }
         }
@@ -455,8 +501,15 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         guard !stopped else { return }
         guard units.indices.contains(index) else {
             if reachedEnd { onFinish?() }
-            else { onNeedMore?(); publishStatus() }
+            else {
+                if !isPaused, !generationBlocked { guard beginPreparationBackgroundTask() else { return } }
+                onNeedMore?()
+                publishStatus()
+            }
             return
+        }
+        if !isPaused, !generationBlocked, player.timeControlStatus != .playing {
+            guard beginPreparationBackgroundTask() else { return }
         }
         let remainingItems = player.items()
         var precedingItem: AVPlayerItem?
@@ -514,6 +567,7 @@ private final class ReaderHTTPSpeechQueue: NSObject {
         guard units.indices.contains(index), units[index].id == unitID else { return }
         let unit = units[index]
         let value = prepared[unit.id]!
+        endPreparationBackgroundTask()
         if activeUnitID != unitID {
             activeUnitID = unitID
             activeEngine = value.engine

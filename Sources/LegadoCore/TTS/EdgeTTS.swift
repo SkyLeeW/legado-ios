@@ -243,6 +243,7 @@ struct EdgeTTSService: Sendable {
 
 /// 用 URLSessionWebSocketTask 建立 Edge 合成连接，握手失败时保留 HTTP 状态和 Date。
 final class URLSessionEdgeTTSWebSocketConnecting: EdgeTTSWebSocketConnecting, Sendable {
+    /// 握手等待随听书任务一起取消，后台准备到期或用户停止后立即释放连接。
     func open(url: URL, headers: [String: String], timeout: TimeInterval) async throws -> any EdgeTTSWebSocket {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
@@ -254,8 +255,19 @@ final class URLSessionEdgeTTSWebSocketConnecting: EdgeTTSWebSocketConnecting, Se
         let task = session.webSocketTask(with: request)
         sessionDelegate.task = task
         task.resume()
-        try await sessionDelegate.waitUntilOpen()
-        return Socket(session: session, task: task, delegate: sessionDelegate)
+        do {
+            try await withTaskCancellationHandler {
+                try await sessionDelegate.waitUntilOpen()
+            } onCancel: {
+                session.invalidateAndCancel()
+            }
+            try Task.checkCancellation()
+            return Socket(session: session, task: task, delegate: sessionDelegate)
+        } catch {
+            session.invalidateAndCancel()
+            try Task.checkCancellation()
+            throw error
+        }
     }
 
     private final class Delegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
@@ -344,13 +356,26 @@ final class URLSessionEdgeTTSWebSocketConnecting: EdgeTTSWebSocketConnecting, Se
             session.finishTasksAndInvalidate()
         }
 
+        /// 发送 SSML 时响应上层取消，避免停止听书后仍保留正在发送的合成请求。
         func send(text: String) async throws {
-            try await task.send(.string(text))
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await task.send(.string(text))
+            } onCancel: {
+                task.cancel(with: .goingAway, reason: nil)
+            }
         }
 
+        /// 接收等待响应上层取消，连接因主动取消关闭时保持取消语义，不误报渠道故障。
         func receive() async throws -> EdgeTTSWebSocketMessage {
             do {
-                switch try await task.receive() {
+                let message = try await withTaskCancellationHandler {
+                    try Task.checkCancellation()
+                    return try await task.receive()
+                } onCancel: {
+                    task.cancel(with: .goingAway, reason: nil)
+                }
+                switch message {
                 case .string(let text):
                     return .text(text)
                 case .data(let data):
@@ -361,6 +386,7 @@ final class URLSessionEdgeTTSWebSocketConnecting: EdgeTTSWebSocketConnecting, Se
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                try Task.checkCancellation()
                 if task.closeCode == .normalClosure || task.closeCode == .goingAway {
                     return .close
                 }

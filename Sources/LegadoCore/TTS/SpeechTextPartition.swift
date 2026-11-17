@@ -4,16 +4,21 @@ import Foundation
 public enum SpeechTextPartition {
     /// 将页间分界顺延到系统识别的完整句末，跨页句子只合成一次，并完整保留起播后的原文。
     public static func sentenceAlignedPages(text: String, position: Int, visibleRanges: [NSRange]) -> [NSRange] {
-        let source = text as NSString
         let pageRanges = pages(text: text, position: position, visibleRanges: visibleRanges)
-        guard let first = pageRanges.first else { return [] }
-        let boundaries = pageRanges.dropFirst().map(\.location)
+        return alignedToSentences(text: text, position: position, preferredBoundaries: pageRanges.dropFirst().map(\.location))
+    }
+
+    /// 所有渠道共用句末分界算法，字数、半章和页尾只决定目标长度，不直接截断正在朗读的句子。
+    public static func alignedToSentences(text: String, position: Int, preferredBoundaries: [Int]) -> [NSRange] {
+        let source = text as NSString
+        if source.length == 0 || position >= source.length { return [] }
+        let beginning = source.rangeOfComposedCharacterSequence(at: position).location
+        let boundaries = Array(Set(preferredBoundaries.filter { $0 > beginning && $0 < source.length })).sorted()
         var boundaryIndex = 0
-        var start = first.location
+        var start = beginning
         var result: [NSRange] = []
-        source.enumerateSubstrings(in: NSRange(location: 0, length: source.length),
-                                   options: [.bySentences, .substringNotRequired]) { _, _, enclosingRange, _ in
-            let end = NSMaxRange(enclosingRange)
+        for sentence in sentenceRanges(text: text) {
+            let end = NSMaxRange(sentence)
             if boundaryIndex < boundaries.count, boundaries[boundaryIndex] <= end {
                 while boundaryIndex < boundaries.count, boundaries[boundaryIndex] <= end { boundaryIndex += 1 }
                 result.append(NSRange(location: start, length: end - start))
@@ -21,6 +26,17 @@ public enum SpeechTextPartition {
             }
         }
         if start < source.length { result.append(NSRange(location: start, length: source.length - start)) }
+        return result
+    }
+
+    /// 系统句子枚举的 enclosingRange 完整覆盖原文及分隔符，各渠道复用同一组自然语言边界。
+    static func sentenceRanges(text: String) -> [NSRange] {
+        let source = text as NSString
+        var result: [NSRange] = []
+        source.enumerateSubstrings(in: NSRange(location: 0, length: source.length),
+                                   options: [.bySentences, .substringNotRequired]) { _, _, enclosingRange, _ in
+            result.append(enclosingRange)
+        }
         return result
     }
 

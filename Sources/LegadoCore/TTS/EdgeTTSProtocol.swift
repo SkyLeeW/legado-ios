@@ -58,25 +58,35 @@ enum EdgeTTSText {
         let range: NSRange
     }
 
-    /// 逐 Unicode 标量填满 4096 字节请求，不截断 UTF-8、XML 实体或删除原文。
+    /// 在 4096 字节内按共同句子边界装入请求；单句本身超限时才按 Unicode 标量分帧，保留全部原文。
     static func chunks(_ text: String) -> [Chunk] {
         var result: [Chunk] = []
         var escapedText = ""
         var bytes = 0
         var start = 0
         var position = 0
-        for scalar in removeIncompatible(text).unicodeScalars {
-            let value = String(scalar)
-            let escaped = escape(value)
-            if bytes + escaped.utf8.count > 4096 {
+        let source = removeIncompatible(text) as NSString
+        for range in SpeechTextPartition.sentenceRanges(text: source as String) {
+            let sentence = source.substring(with: range)
+            if !escapedText.isEmpty, bytes + escape(sentence).utf8.count > 4096 {
                 result.append(.init(escapedText: escapedText, range: NSRange(location: start, length: position - start)))
                 escapedText = ""
                 bytes = 0
                 start = position
             }
-            escapedText += escaped
-            bytes += escaped.utf8.count
-            position += value.utf16.count
+            for scalar in sentence.unicodeScalars {
+                let value = String(scalar)
+                let escaped = escape(value)
+                if bytes + escaped.utf8.count > 4096 {
+                    result.append(.init(escapedText: escapedText, range: NSRange(location: start, length: position - start)))
+                    escapedText = ""
+                    bytes = 0
+                    start = position
+                }
+                escapedText += escaped
+                bytes += escaped.utf8.count
+                position += value.utf16.count
+            }
         }
         if !escapedText.isEmpty {
             result.append(.init(escapedText: escapedText, range: NSRange(location: start, length: position - start)))
