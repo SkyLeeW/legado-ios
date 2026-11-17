@@ -22,8 +22,8 @@ defaults:
 jobs:
   build-and-release:
     name: 构建和发布未签名 IPA
-    # 使用官方 macOS 15 ARM 托管机，镜像提供下方指定的 Xcode 版本。
-    runs-on: macos-15
+    # 固定官方 macOS 15 Intel 托管机，使用镜像明确提供的 Xcode 26.1.1 构建 iOS 归档。
+    runs-on: macos-15-intel
     timeout-minutes: 60
     env:
       # 固定项目所需的 Xcode 版本，工具缺失时直接失败。
